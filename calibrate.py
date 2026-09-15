@@ -41,6 +41,7 @@ and nothing more.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from dataclasses import replace
 
@@ -181,8 +182,7 @@ def describe_pending(store: Store, held_out: int, held_hours: float,
         "Not caution for its own sake. Every row of a sweep is a win/loss count over",
         f"a handful of trades, and the trend veto alone takes {warm_bars} bars "
         f"({warm_hours:.1f}h) of one unbroken run to exist at all — on a short "
-        "window the columns",
-        "would be measuring warm-up, not dials.",
+        f"window the columns would be measuring warm-up, not dials.",
     ]
 
     needed = trades_needed(_HOPED_RATE, break_even)
@@ -214,6 +214,30 @@ def describe_pending(store: Store, held_out: int, held_hours: float,
         f"window would hold about {reachable:.0f} settled trade(s), which clears "
         f"the gate."
     )
+
+    if reachable <= min_trades and rate_per_hour > 0:
+        # The cap, not the clock, is what is too small — and unlike "wait longer"
+        # that is something the reader can act on, so name the size it would take.
+        # MAX_BARS is the one dial here that changes no strategy: it decides how
+        # much history the sweep may look at, not what the engine does with a bar.
+        #
+        # Zero signals/hour is deliberately excluded: the arithmetic is
+        # undefined, and a rate measured as zero is a statement about the window
+        # rather than about the dials.
+        store_hours = min_trades / rate_per_hour / (1.0 - split)
+        bars = math.ceil(store_hours * 3600.0 / store.cfg.candle_period)
+        lines.append("")
+        lines.append(
+            f"So no amount of uptime prints this table at this rate — the cap is "
+            f"what is short, not the clock. {min_trades} held-out trades needs "
+            f"about {store_hours:.0f}h of store, which is MAX_BARS={bars} at "
+            f"{store.cfg.candle_period}s bars; it is {store.cfg.max_bars} today. "
+            f"Until it is raised the store is not merely failing to grow, it is "
+            f"discarding every bar older than {ceiling:.1f}h — so raising it is "
+            f"worth doing before that history is gone, not after. It is not a "
+            f"strategy change (it decides how much history the sweep may read, "
+            f"not what the engine does with a bar) but it wants its own restart."
+        )
 
     if reachable > min_trades:
         # The rate is enough given time; the only question is how much time.

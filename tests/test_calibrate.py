@@ -243,6 +243,44 @@ class TestTheRefusalSaysWhetherWaitingWouldEvenHelp(CalibrateCase):
         self.assertIn("0.67 signals/hour", wide)
         self.assertIn("6.67 signals/hour", narrow)
 
+    def test_a_rate_under_the_gate_names_the_store_that_would_reach_it(self):
+        # "The cap is too small" is not actionable on its own. 1 signal/hour in a
+        # window held out at 40% of the store needs 30/1/0.4 = 75h of store, which
+        # at 60s bars is MAX_BARS=4500 against the 1000 this config has.
+        self.write_store(count=300)
+        store = calibrate.Store(self.dir, make_config())
+
+        text = calibrate.describe_pending(store, 2, 2.0, 30, 0.541, 0.6)
+
+        self.assertIn("about 75h of store", text)
+        self.assertIn("MAX_BARS=4500", text)
+        self.assertIn("it is 1000 today", text)
+        self.assertIn("not a strategy change", text,
+                      "the reason a reader may act on this one and not on a dial")
+
+    def test_the_size_named_is_the_gate_the_tool_actually_refuses_on(self):
+        # Not a decoration: double the gate and the store it needs doubles, so
+        # the figure has to come from the same min_trades the refusal used.
+        self.write_store(count=300)
+        store = calibrate.Store(self.dir, make_config())
+
+        shallow = calibrate.describe_pending(store, 2, 2.0, 30, 0.541, 0.6)
+        deep = calibrate.describe_pending(store, 2, 2.0, 60, 0.541, 0.6)
+
+        self.assertIn("MAX_BARS=4500", shallow)
+        self.assertIn("MAX_BARS=9000", deep)
+
+    def test_a_zero_rate_is_not_turned_into_a_store_size(self):
+        # Nothing was measured, so no size follows from it — and the size of the
+        # store is not what would have to change if the window is simply warming.
+        self.write_store(count=300)
+        store = calibrate.Store(self.dir, make_config())
+
+        text = calibrate.describe_pending(store, 0, 2.0, 30, 0.541, 0.6)
+
+        self.assertNotIn("MAX_BARS=", text)
+        self.assertIn("under the gate", text)
+
 
 class TestTheReading(CalibrateCase):
     def test_a_table_of_nothing_is_reported_as_nothing(self):

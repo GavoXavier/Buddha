@@ -195,6 +195,15 @@ operator is not told to wait for something that cannot arrive:
 - **the store is still mostly warm-up** — the measured rate is a floor rather than a
   forecast, so it may rise as the window fills.
 
+And when the cap is what is short, it names **the store size that would not be** —
+`MAX_BARS` is the one setting here that changes no strategy at all, since it decides
+how much history the sweep may read rather than what the engine does with a bar. On
+the live store at 1.25 signals/hour, 30 held-out trades needs about 48h of store:
+`MAX_BARS=576` against the 500 in `.env`. That is a reachable number rather than a
+reproach — but while it is unraised the store is not merely failing to grow, it is
+*discarding* everything older than 41.7h, so it is worth raising before that history
+is gone rather than after.
+
 Two things it cannot do, both stated in its own output:
 
 - **The store records prices, not payouts.** A single assumed payout (`--payout`,
@@ -352,7 +361,7 @@ POCKET/
 │   └── ranking.py        # picking one market out of many
 ├── data/                 # base.py, pocket_option.py, simulated.py
 ├── telegram/             # sender.py (formatting), control.py (/commands)
-└── tests/                # 537 tests, ~16 seconds, no network
+└── tests/                # 540 tests, ~16 seconds, no network
 ```
 
 ## Setup
