@@ -7,12 +7,22 @@ token is a shared secret and a stranger who guesses the chat id must not be able
 to pause trading or read the stats.
 
 Commands: /status /stats /assets /hours /pause /resume /stop /help.
+
+**A command from before the bot started is never obeyed**, and that is enforced by
+the message's own timestamp rather than only by the update offset. Telegram keeps
+updates for 24 hours, so a ``/stop`` typed yesterday is still sitting there at
+startup; the offset is advanced past the backlog to skip it, but if that first
+``getUpdates`` fails — a network blip at exactly the wrong moment — the offset
+stays at zero and the whole backlog is delivered. Acting on it would shut the bot
+down on a day-old instruction. Comparing ``message.date`` against the process
+start cannot be defeated that way.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Awaitable, Callable, Optional
 
 import aiohttp
@@ -31,6 +41,12 @@ HELP_TEXT = "\n".join([
 ])
 
 _POLL_TIMEOUT = 25
+
+# How far before this process started a command may have been sent and still be
+# obeyed. Not zero, because ``message.date`` is Telegram's clock and not ours, and
+# a few seconds of skew must not silently disable remote control; and small
+# enough that "something queued while the bot was off" is still skipped.
+_STALE_SLACK = 60.0
 
 
 class BotController:
@@ -65,20 +81,29 @@ class TelegramControl:
         self._task: Optional[asyncio.Task] = None
         self._session: Optional[aiohttp.ClientSession] = None
         self._enabled = True
+        # Everything sent before this instant is history, whatever the offset
+        # says. See the module docstring for why the offset alone is not enough.
+        self._started_at = time.time()
 
     async def start(self) -> None:
         if self._session is None:
             connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
             self._session = aiohttp.ClientSession(connector=connector)
         # Skip anything queued while the bot was off, so a stale "/pause" from
-        # yesterday cannot surprise the operator today.
+        # yesterday cannot surprise the operator today. This is the fast path; the
+        # timestamp check in ``_handle`` is what makes it safe when it fails.
         await self._drain_backlog()
         self._task = asyncio.create_task(self._run(), name="telegram-control")
 
     async def _drain_backlog(self) -> None:
         try:
             updates = await self._get_updates(timeout=0)
-        except Exception:
+        except Exception as exc:
+            # Not fatal, and not silent: the offset stays where it was, so the
+            # next poll re-reads the backlog — which is exactly the case the
+            # timestamp check exists to make harmless.
+            log.debug("could not drain the command backlog, so old updates will be "
+                      "re-read (and dropped by age): %s", exc)
             return
         for update in updates:
             self._offset = max(self._offset, int(update.get("update_id", 0)) + 1)
@@ -117,6 +142,23 @@ class TelegramControl:
                 self._offset = max(self._offset, int(update.get("update_id", 0)) + 1)
                 await self._handle(update)
 
+    def _is_stale(self, message: dict) -> bool:
+        """Whether this message predates the process, and must not be obeyed.
+
+        A message with no readable ``date`` is treated as stale, which fails in the
+        direction that costs least: the bot keeps trading and the operator can see
+        in the log why the commands stopped arriving. Obeying it would mean a
+        day-old ``/stop`` could kill a session — the failure the backlog drain
+        exists to prevent, so the check must not depend on the drain working.
+        """
+        try:
+            sent = float(message["date"])
+        except (KeyError, TypeError, ValueError):
+            log.warning("update with no usable date, ignoring the command in it: %r",
+                        message.get("text"))
+            return True
+        return sent < self._started_at - _STALE_SLACK
+
     async def _handle(self, update: dict) -> None:
         message = update.get("message") or {}
         chat = message.get("chat") or {}
@@ -125,6 +167,10 @@ class TelegramControl:
             return
         text = (message.get("text") or "").strip()
         if not text.startswith("/"):
+            return
+        if self._is_stale(message):
+            log.info("ignoring a command sent before this session started: %r "
+                     "(it was queued while the bot was off)", text)
             return
         command = text.split()[0].split("@")[0].lower()
         log.info("command received: %s", command)

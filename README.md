@@ -325,7 +325,7 @@ POCKET/
 │   └── ranking.py        # picking one market out of many
 ├── data/                 # base.py, pocket_option.py, simulated.py
 ├── telegram/             # sender.py (formatting), control.py (/commands)
-└── tests/                # 499 tests, ~16 seconds, no network
+└── tests/                # 511 tests, ~16 seconds, no network
 ```
 
 ## Setup
