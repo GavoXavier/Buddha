@@ -144,22 +144,150 @@ class TestPersistence(StatsCase):
                              encoding="utf-8")
         self.assertEqual(self.new_tracker().total, 0)
 
-    def test_legacy_winrate_file_is_imported(self):
+    def test_legacy_winrate_file_is_kept_but_not_counted(self):
         self.legacy.write_text(json.dumps({"wins": 7, "losses": 3}), encoding="utf-8")
 
         imported = self.new_tracker()
-        self.assertEqual((imported.wins, imported.losses), (7, 3))
-        self.assertEqual(imported.total, 10)
+        self.assertEqual((imported.legacy.wins, imported.legacy.losses), (7, 3))
+        # Not folded into the measured record: those totals have no trades
+        # behind them, so counting them would put a headline above tables that
+        # cannot add up to it.
+        self.assertEqual(imported.total, 0)
+        self.assertEqual((imported.wins, imported.losses), (0, 0))
+
+    def test_legacy_totals_invent_no_streak(self):
+        self.legacy.write_text(json.dumps({"wins": 7, "losses": 3}), encoding="utf-8")
+        imported = self.new_tracker()
+        # The old code set best_streak = wins, claiming seven wins in a row
+        # that no result ever recorded.
+        self.assertEqual(imported.best_streak, 0)
+        self.assertEqual(imported.streak, 0)
+
+    def test_legacy_is_reported_apart_from_the_record(self):
+        self.legacy.write_text(json.dumps({"wins": 7, "losses": 3}), encoding="utf-8")
+        self.stats.record("EURUSD_otc", "CALL", "WIN", at=AT)
+        self.stats.save(force=True)
+
+        text = self.new_tracker().summary_text()
+        self.assertIn("1  (1W / 0L)", text)
+        self.assertIn("Legacy record (imported, not counted above): 7W/3L 70%", text)
+
+    def test_legacy_is_imported_once_and_then_loaded(self):
+        self.legacy.write_text(json.dumps({"wins": 7, "losses": 3}), encoding="utf-8")
+        self.stats.record("A", "CALL", "WIN", at=AT)
+        self.stats.save(force=True)
+
+        self.stats.legacy = Tally(wins=7, losses=3)
+        self.stats.save(force=True)
+        # Changing the legacy file must not change a record already adopted.
+        self.legacy.write_text(json.dumps({"wins": 99, "losses": 99}), encoding="utf-8")
+        self.assertEqual(self.new_tracker().legacy.total, 10)
 
     def test_legacy_import_does_not_override_real_stats(self):
         self.stats.record("A", "CALL", "WIN", at=AT)
         self.stats.save(force=True)
         self.legacy.write_text(json.dumps({"wins": 99, "losses": 99}), encoding="utf-8")
-        self.assertEqual(self.new_tracker().total, 1)
+        reloaded = self.new_tracker()
+        self.assertEqual(reloaded.total, 1)
+        self.assertEqual(reloaded.legacy.total, 198)
 
     def test_missing_legacy_file_is_fine(self):
         self.assertFalse(self.legacy.exists())
         self.assertEqual(self.new_tracker().total, 0)
+
+
+class TestTheFoldedInLegacyIsTakenBackOut(StatsCase):
+    """The record repaired on load, for files the old importer inflated.
+
+    Observed live on 2026-09-15: the log read ``12W/7L = 63%`` for a journal
+    holding 15 settled trades, 9W/6L, with the difference being exactly the
+    3W/1L printed under it as "kept out of that figure". The old importer set
+    ``overall`` to the winrate.json totals and the real results were added on
+    top of them; the fix stops new files being written that way, and this puts
+    an already-written one right.
+    """
+
+    REAL = (9, 6)
+    LEGACY = (3, 1)
+
+    def folded_in_file(self, real=REAL, legacy=LEGACY, with_legacy_field=False):
+        """An inflated stats file, in either of the two shapes that exist."""
+        wins, losses = real
+        doc = {
+            "version": 1,
+            "global": {"wins": wins + legacy[0], "losses": losses + legacy[1]},
+            "by_asset": {"EURUSD_otc": {"wins": wins, "losses": losses}},
+            "by_hour": {"20": {"wins": wins, "losses": losses}},
+            "recent": [],
+        }
+        if with_legacy_field:
+            doc["legacy"] = {"wins": legacy[0], "losses": legacy[1]}
+        self.path.write_text(json.dumps(doc), encoding="utf-8")
+        self.legacy.write_text(json.dumps({"wins": legacy[0], "losses": legacy[1]}),
+                               encoding="utf-8")
+        return self.new_tracker()
+
+    def test_the_totals_come_back_out_of_the_record(self):
+        repaired = self.folded_in_file()
+
+        self.assertEqual((repaired.wins, repaired.losses), self.REAL)
+        self.assertEqual(repaired.legacy.total, 4, "still kept, still apart")
+
+    def test_the_headline_agrees_with_the_tables_again(self):
+        text = self.folded_in_file().summary_text()
+
+        self.assertIn("15  (9W / 6L)", text)
+        self.assertIn("Legacy record (imported, not counted above): 3W/1L", text)
+
+    def test_the_per_market_and_per_hour_tables_are_untouched(self):
+        repaired = self.folded_in_file()
+
+        self.assertEqual(repaired.by_asset["EURUSD_otc"].total, 15)
+        self.assertEqual(repaired.by_hour[20].total, 15)
+
+    def test_a_file_from_after_the_fix_is_repaired_as_well(self):
+        # The live file: the tally is stored beside the record, so waiting for
+        # a file with no "legacy" field would never have reached it.
+        self.assertEqual(self.folded_in_file(with_legacy_field=True).wins, 9)
+
+    def test_the_repair_is_not_applied_twice(self):
+        self.folded_in_file().save(force=True)
+
+        again = self.new_tracker()
+        self.assertEqual((again.wins, again.losses), self.REAL,
+                         "a repaired file must survive a reload unsullied")
+
+    def test_a_correct_file_is_left_alone(self):
+        self.path.write_text(json.dumps({
+            "version": 1,
+            "global": {"wins": 9, "losses": 6},
+            "by_asset": {"EURUSD_otc": {"wins": 9, "losses": 6}},
+            "legacy": {"wins": 3, "losses": 1},
+        }), encoding="utf-8")
+
+        self.assertEqual(self.new_tracker().wins, 9)
+
+    def test_a_file_with_no_legacy_tally_to_remove_is_left_alone(self):
+        self.path.write_text(json.dumps({
+            "version": 1,
+            "global": {"wins": 9, "losses": 6},
+            "by_asset": {"EURUSD_otc": {"wins": 9, "losses": 6}},
+        }), encoding="utf-8")
+        self.assertFalse(self.legacy.exists())
+
+        self.assertEqual(self.new_tracker().wins, 9)
+
+    def test_a_difference_that_is_not_the_legacy_total_is_left_alone(self):
+        # Something else made the headline disagree with the tables. Removing
+        # the legacy tally would be a guess dressed up as a repair.
+        self.path.write_text(json.dumps({
+            "version": 1,
+            "global": {"wins": 14, "losses": 6},
+            "by_asset": {"EURUSD_otc": {"wins": 9, "losses": 6}},
+        }), encoding="utf-8")
+        self.legacy.write_text(json.dumps({"wins": 3, "losses": 1}), encoding="utf-8")
+
+        self.assertEqual(self.new_tracker().wins, 14)
 
 
 class TestReporting(StatsCase):

@@ -64,6 +64,10 @@ class StatsTracker:
         self.tz_offset_hours = tz_offset_hours
 
         self.overall = Tally()
+        # Totals inherited from winrate.json, which predate this tracker and
+        # carry no per-market or per-hour breakdown. Kept as their own tally so
+        # they can never be read as part of the record measured here.
+        self.legacy = Tally()
         self.by_asset: dict[str, Tally] = {}
         self.by_hour: dict[int, Tally] = {}
         self.streak = 0            # >0 consecutive wins, <0 consecutive losses
@@ -97,9 +101,78 @@ class StatsTracker:
         self.best_streak = int(doc.get("best_streak", 0))
         self.worst_streak = int(doc.get("worst_streak", 0))
         self.recent = list(doc.get("recent", []))[-_RECENT_LIMIT:]
+        self.legacy = Tally.from_dict(doc.get("legacy", {}))
+
+        # A stats file written before the legacy tally existed has no "legacy"
+        # field, so read winrate.json for it. Importing is a *set*, never an
+        # add, so running it on every load cannot double-count; and it stops
+        # being reached at all once the number has been saved once.
+        if not self.legacy.total:
+            self._import_legacy()
+        # Deliberately outside that branch, and re-run on every load: a file
+        # written by the *fixed* importer has the legacy tally stored beside the
+        # record and the totals still folded in, so the "no legacy field yet"
+        # test cannot find it. The check inside is exact and idempotent, which
+        # is what makes running it unconditionally safe.
+        self._unfold_legacy_if_it_was_counted()
+
+    def _unfold_legacy_if_it_was_counted(self) -> None:
+        """Take the winrate.json totals back out of a record that includes them.
+
+        The bug this repairs: the old importer *set* ``overall`` to the
+        winrate.json totals rather than keeping them aside, and the real trades
+        were then added on top of them — so the headline ran ahead of every
+        table printed under it, and stayed ahead forever, because the next load
+        set it again and added on top again. On 2026-09-15 the bot was showing
+        12W/7L for a journal that held 9W/6L settled, the difference being
+        exactly the 3W/1L shown alongside as "kept out of that figure".
+
+        The evidence is exact rather than heuristic, and that is why the check
+        is not merely "is there a legacy tally to remove". Those totals were
+        only ever counted whole: they were never broken down by market or by
+        hour, because nothing about them is known except the two numbers. So a
+        record carrying them is ahead of the by-market sums by *precisely* the
+        amount imported, and a file that never had them folded in — from a build
+        older than the legacy tally, or from this one — is not ahead at all.
+        Matching on that keeps a correct file correct, which guessing from the
+        file's age could not.
+
+        Only ``overall`` is put back. The old importer also set
+        ``best_streak = wins``, inventing a run that was never observed, and
+        nothing can say what the real best run was before this tracker had
+        per-trade records — so the invented number is left where it is and will
+        simply stand until a real run beats it.
+        """
+        if not self.legacy.total:
+            return
+        broken_down = sum(t.total for t in self.by_asset.values())
+        if self.overall.total - broken_down != self.legacy.total:
+            return
+
+        self.overall = Tally(wins=self.overall.wins - self.legacy.wins,
+                             losses=self.overall.losses - self.legacy.losses)
+        log.info("older stats file had the %dW/%dL from %s folded into the record "
+                 "- took them back out, it is now %dW/%dL",
+                 self.legacy.wins, self.legacy.losses, self.legacy_path,
+                 self.overall.wins, self.overall.losses)
 
     def _import_legacy(self) -> None:
-        """Adopt the old winrate.json totals so the record isn't lost on upgrade."""
+        """Read the pre-upgrade totals in ``winrate.json`` into ``self.legacy``.
+
+        These are the records the bot kept before this tracker existed. They are
+        kept, and kept apart, for two reasons.
+
+        They are not part of the measured record: they have no per-market or
+        per-hour breakdown and no trades behind them, so folding them into
+        ``overall`` made the headline disagree with every table printed beneath
+        it — 80% overall above a by-market table that summed to something else
+        entirely — which is worse than the totals being incomplete.
+
+        And they are totals only, so nothing about a *streak* can be recovered
+        from them. The old code set ``best_streak = wins``, which invented a
+        run of wins that was never observed and could never be broken by any
+        real result.
+        """
         if self.legacy_path is None:
             return
         try:
@@ -109,9 +182,9 @@ class StatsTracker:
             return
         wins, losses = int(data.get("wins", 0)), int(data.get("losses", 0))
         if wins or losses:
-            self.overall = Tally(wins=wins, losses=losses)
-            self.best_streak = wins
-            log.info("imported %dW/%dL from %s", wins, losses, self.legacy_path)
+            self.legacy = Tally(wins=wins, losses=losses)
+            log.info("kept %dW/%dL from %s as a separate legacy record",
+                     wins, losses, self.legacy_path)
 
     def save(self, force: bool = False) -> None:
         now = time.time()
@@ -122,6 +195,7 @@ class StatsTracker:
             "version": _SCHEMA_VERSION,
             "updated": now,
             "global": self.overall.as_dict(),
+            "legacy": self.legacy.as_dict(),
             "by_asset": {k: v.as_dict() for k, v in self.by_asset.items()},
             "by_hour": {str(k): v.as_dict() for k, v in self.by_hour.items()},
             "streak": self.streak,
@@ -212,7 +286,7 @@ class StatsTracker:
     def summary_lines(self) -> list[str]:
         """Compact human-readable report (Telegram-safe: no raw <, > or &)."""
         if self.total == 0:
-            return ["No completed trades yet."]
+            return ["No completed trades yet.", *self._legacy_lines()]
         lines = [
             f"Trades: {self.total}  ({self.wins}W / {self.losses}L)",
             f"Win rate: {self.win_rate:.0%}",
@@ -236,7 +310,23 @@ class StatsTracker:
             lines.append("Best hours (local):")
             for hour, tally in hours:
                 lines.append(f"  {hour:02d}:00 - {tally.win_rate:.0%} ({tally.wins}/{tally.total})")
-        return lines
+        return lines + self._legacy_lines()
+
+    def _legacy_lines(self) -> list[str]:
+        """The imported pre-upgrade record, reported apart from the rest.
+
+        Printed separately rather than merged because it is the only number
+        here that nothing below it can account for: the tables are built from
+        individual trades and this is not. Saying so is the difference between
+        an incomplete record and a misleading one.
+        """
+        if not self.legacy.total:
+            return []
+        return [
+            "",
+            f"Legacy record (imported, not counted above): "
+            f"{self.legacy.wins}W/{self.legacy.losses}L {self.legacy.win_rate:.0%}",
+        ]
 
     def summary_text(self) -> str:
         return "\n".join(self.summary_lines())
