@@ -199,6 +199,18 @@ class Store:
             return 0.0
         return max(0.0, (max(marks) - min(marks)) / 3600.0)
 
+    def ceiling_hours(self) -> float:
+        """The most history this store can ever hold, however long the bot runs.
+
+        ``CandleStore.save`` keeps the newest ``max_bars`` per market and drops the
+        oldest, so the store is a rolling window and not an archive: past
+        ``max_bars * period`` seconds of uptime the span stops growing and starts
+        sliding instead. That is the ceiling on the sample a sweep can ever see, and
+        the reason "leave it running a few more days" is not always an answer —
+        ``calibrate.describe_pending`` does that arithmetic.
+        """
+        return self.cfg.max_bars * self.cfg.candle_period / 3600.0
+
     def deepest_run(self) -> int:
         """Bars in the longest contiguous run any market offers.
 
@@ -404,8 +416,10 @@ class Replay:
         total_bars = sum(len(c) for c in self.store.bars.values())
         total_runs = sum(len(r) for r in self.store.runs.values())
         print("-" * 68)
+        ceiling = self.store.ceiling_hours()
         print(f"{'':<16}{total_bars:>6}{total_runs:>6}{self.store.deepest_run():>9}"
-              f"  over {hours:.1f}h across {len(self.store.bars)} markets")
+              f"  over {hours:.1f}h across {len(self.store.bars)} markets "
+              f"(of {ceiling:.1f}h the cap allows)")
         print()
         if total_runs > len(self.store.bars):
             print(f"{total_runs} contiguous runs over {len(self.store.bars)} markets: "

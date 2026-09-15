@@ -93,7 +93,14 @@ The measurement below was taken on **1-minute bars**, which is what the dials we
 calibrated against. The bar length changes what they mean — `MTF_FACTOR=5` is a
 5-minute confirmation on 1m bars and a 25-minute one on 5m bars, and
 `TREND_MIN_DISTANCE_PCT` is a move per 50 bars either way — so re-measure with
-`python backtest.py` after the store has a couple of days of 5-minute bars in it.
+`python backtest.py` once there are 5-minute bars to replay.
+
+**"Once there are bars" is not the same as "wait a couple of days".** The store is
+a rolling window, not an archive: it keeps the newest `MAX_BARS` per market and
+drops the oldest, so 500 bars of 5-minute candles is a span of ~41.7 hours that
+stops growing and starts sliding. Uptime past that adds no sample, and the sample
+is what the replay needs — `calibrate.py` prints this arithmetic rather than
+suggesting a wait that cannot help.
 
 Measured on the shipped dials, replaying tick-built bars from a simulated run of
 three major pairs (`python backtest.py --dir <store>`, 8.3 hours, 500 minutes
@@ -154,7 +161,7 @@ setups that are clear even without a trend.
 
 ```bash
 python calibrate.py                  # sweep the dials, on bars held back from it
-python calibrate.py --min-hours 0    # sweep a store too short to mean anything
+python calibrate.py --min-trades 0   # sweep anyway, and read it as what it is
 python calibrate.py --payout 92      # compare against a different break-even
 ```
 
@@ -162,16 +169,31 @@ Every market's history is cut by time into a **training** window and a window
 **held back** from the sweep, and the table prints both columns side by side. The
 train column is what a search would have picked; the held-out column is what
 happened next. Where they disagree, the train column was noise — which on a short
-store is most of the time, and seeing that is the point.
+store is most of the time, and seeing that is the point. On this project's own
+store the first table printed had `TREND_EMA_LEN=20` at 57% on the train column
+and 0% held out, which is the lesson in one row.
 
 One dial is varied at a time from the shipped settings, never a cross product.
 The question worth asking first is what each dial *buys*, and a grid over six
 dials is unreadable with a best row that is a coincidence.
 
-**It refuses to sweep a store shorter than `--min-hours` (48 by default)**, and
-prints how much longer to wait instead of a table. That is not timidity: the
-trend veto alone needs 4h40m of one unbroken run, so on a five-hour store the
-columns would be measuring warm-up rather than dials.
+**It refuses to sweep a sample smaller than `--min-trades` (30 by default)**, and
+prints why instead of a table. That is not timidity: the trend veto alone needs
+4h40m of one unbroken run, so on a five-hour store the columns would be measuring
+warm-up rather than dials. 30 is also the lenient end of the statistics — at 85%
+payout, a 70% rate needs about 37 settled trades before its *lower* bound clears
+break-even.
+
+The gate is a trade count and not an hours figure because the store rolls over: an
+hours gate would be satisfiable by leaving the bot running past a point where the
+span can no longer grow. The refusal says which of the three cases applies, so the
+operator is not told to wait for something that cannot arrive:
+
+- **the rate reaches the gate** — how many more hours of uptime it needs;
+- **the store is past warm-up and the rate does not** — waiting cannot help, because
+  the sample is capped by the rate and the rate is what the sweep exists to change;
+- **the store is still mostly warm-up** — the measured rate is a floor rather than a
+  forecast, so it may rise as the window fills.
 
 Two things it cannot do, both stated in its own output:
 
@@ -226,7 +248,10 @@ components degrade gracefully while they fill in: the bot signals as soon as
 12/56 bars" rather than staying silently broken. The trend is the exception, and
 it is a large one — see [below](#the-one-component-that-vetoes-is-the-one-that-can-be-missing).
 Raise `MAX_BARS` to hold more history; restart warm-up is free once the store has
-data.
+data. Because the store keeps only the newest `MAX_BARS` per market, `MAX_BARS` is
+also the one dial that changes how much *sample* a backtest can ever see — 500 bars
+of 5-minute candles is ~41.7 hours, and past that the window slides rather than
+grows.
 
 **Warm-up is counted in bars, so it scales with the bar length.** On 5-minute
 bars the first possible signal is 18 bars ≈ **90 minutes** after a cold start, and
@@ -293,8 +318,10 @@ Two honest ways out, and no third one:
 - **Shorten the EMA.** `TREND_EMA_LEN` is what sets reachability: 20 bars needs
   26, about 2h10m. But a 20-bar EMA is a different and noisier trend reading, and
   nothing in this project has measured whether the shorter veto is *worth having*.
-  That measurement needs 5-minute history in the store — after a couple of days,
-  `python backtest.py` prints how deep the runs get and what that costs.
+  `python backtest.py` prints how deep the runs get and what that costs, and
+  `python calibrate.py` is the tool that would compare `TREND_EMA_LEN=20` against
+  the shipped 50 on held-out bars — once there is a sample for it to read, which
+  the store's rolling cap bounds (see its refusal for the arithmetic).
 
 Leaving `USE_TREND=1` with an unreachable `TREND_EMA_LEN` is the one state worth
 avoiding, because it looks like a filter is running when nothing is.
@@ -325,7 +352,7 @@ POCKET/
 │   └── ranking.py        # picking one market out of many
 ├── data/                 # base.py, pocket_option.py, simulated.py
 ├── telegram/             # sender.py (formatting), control.py (/commands)
-└── tests/                # 511 tests, ~16 seconds, no network
+└── tests/                # 518 tests, ~16 seconds, no network
 ```
 
 ## Setup
@@ -683,7 +710,7 @@ The ones worth knowing first:
 | `TREND_FLAT_MIN_SCORE` | `3` | evidence demanded in a flat market |
 | `USE_TREND` | `1` | the trend as a veto; `0` runs without it, and says so |
 | `TREND_EMA_LEN` | `50` | bars the trend EMA needs — with `TREND_SLOPE_BARS` this sets how deep a run must be before the veto exists (56) |
-| `MAX_BARS` | `500` | bars kept per market in memory and on disk |
+| `MAX_BARS` | `500` | bars kept per market in memory and on disk — also the ceiling on how much history a backtest can ever replay (~41.7h at 300s bars) |
 | `MAX_GAP_BARS` | `5` | feed outage longer than this drops the bars before it |
 | `PERSIST_CANDLES` | `1` | keep bars on disk for a warm restart |
 | `JOURNAL_SIGNALS` | `1` | write the per-trade record `reconcile.py` reads |

@@ -141,38 +141,107 @@ class TestTheVerdictOnlyClaimsWhatTheSampleSupports(CalibrateCase):
         self.assertEqual(calibrate.verdict_of(self.row(1, 0), 0.541), "too few")
 
 
-class TestItRefusesToSweepAShortStore(CalibrateCase):
+class TestItRefusesToSweepASampleTooSmallToRead(CalibrateCase):
     """The refusal is the point of the tool, so it is pinned like one."""
 
-    def test_a_short_store_is_refused_with_the_reason_and_the_wait(self):
+    def test_a_small_sample_is_refused_without_a_table(self):
         self.write_store(count=60)          # one hour of one-minute bars
         cfg = make_config()
 
-        code, out = self.captured(cfg, str(self.dir), 0.0, 0.6, 85.0, 48.0)
+        code, out = self.captured(cfg, str(self.dir), 0.0, 0.6, 85.0, 30)
 
         self.assertEqual(code, 1, "a refusal is not a success")
-        self.assertNotIn("train", out, "there must be no table to misread")
-        self.assertIn("needs at least 48h", out)
-        self.assertIn("--min-hours", out, "it says how to override itself")
+        self.assertNotIn(calibrate.TABLE_HEADER, out,
+                         "there must be no table to misread")
+        self.assertIn("a column is printed from 30", out)
+        self.assertIn("--min-trades", out, "it says how to override itself")
 
-    def test_the_short_store_override_prints_the_table(self):
+    def test_the_override_prints_the_table(self):
         self.write_store(count=60)
         cfg = make_config()
 
-        code, out = self.captured(cfg, str(self.dir), 0.0, 0.6, 85.0, 0.0)
+        code, out = self.captured(cfg, str(self.dir), 0.0, 0.6, 85.0, 0)
 
         self.assertEqual(code, 0)
-        self.assertIn("dials", out)
-        self.assertIn("held out", out)
+        self.assertIn(calibrate.TABLE_HEADER, out)
         self.assertIn("shipped", out)
 
     def test_an_empty_store_is_reported_rather_than_swept(self):
         cfg = make_config()
 
-        code, out = self.captured(cfg, str(self.dir / "nope"), 0.0, 0.6, 85.0, 0.0)
+        code, out = self.captured(cfg, str(self.dir / "nope"), 0.0, 0.6, 85.0, 0)
 
         self.assertEqual(code, 1)
         self.assertIn("No bars in the store", out)
+
+
+class TestTheRefusalSaysWhetherWaitingWouldEvenHelp(CalibrateCase):
+    """A store that has rolled over cannot grow, so "wait a few days" can be a lie.
+
+    ``CandleStore.save`` keeps the newest ``max_bars`` and drops the oldest, which
+    puts a hard ceiling on the trades a store can hold at a given signal rate. When
+    that ceiling is under the gate the tool has to say so, because the alternative —
+    telling the operator to wait for a sample that can never accumulate — is advice
+    that reads as patience and is actually a dead end.
+    """
+
+    def test_a_settled_rate_under_the_gate_cannot_be_waited_out(self):
+        # 300 bars is 5h, well past the 0.9h warm-up, so the rate is the engine's
+        # rate: 1/h over the 6.7h held-out ceiling is 7 trades, and no amount of
+        # uptime reaches 30.
+        self.write_store(count=300)
+        store = calibrate.Store(self.dir, make_config())
+
+        text = calibrate.describe_pending(store, 2, 2.0, 30, 0.541, 0.6)
+
+        self.assertIn("rolling window", text)
+        self.assertIn("cannot close the gap", text)
+        self.assertNotIn("more of uptime", text,
+                         "waiting is not offered when it cannot work")
+
+    def test_a_short_store_calls_its_rate_a_floor_rather_than_a_forecast(self):
+        # 1h of store against a 0.9h warm-up: the zero rate here may be the warm-up
+        # still finishing, and saying "waiting cannot help" would be wrong.
+        self.write_store(count=60)
+        store = calibrate.Store(self.dir, make_config())
+
+        text = calibrate.describe_pending(store, 0, 0.4, 30, 0.541, 0.6)
+
+        self.assertIn("floor and not a forecast", text)
+        self.assertNotIn("cannot close the gap", text)
+
+    def test_a_rate_that_can_reach_the_gate_says_roughly_how_long(self):
+        self.write_store(count=60)
+        store = calibrate.Store(self.dir, make_config())
+
+        text = calibrate.describe_pending(store, 4, 0.4, 30, 0.541, 0.6)
+
+        self.assertIn("clears the gate", text)
+        self.assertIn("more of uptime", text)
+
+    def test_the_ceiling_quoted_is_the_stores_own_cap(self):
+        # 1000 bars at 60s is ~16.7h — the figure in the text has to be that one,
+        # not a guess, or the arithmetic under it is fiction.
+        self.write_store(count=60)
+        store = calibrate.Store(self.dir, make_config())
+
+        text = calibrate.describe_pending(store, 4, 0.4, 30, 0.541, 0.6)
+
+        self.assertIn("16.7h", text)
+        self.assertIn("1000 bars", text)
+        self.assertIn("6.7h of that held out", text)
+
+    def test_the_rate_is_measured_on_the_window_the_gate_was_computed_from(self):
+        # The held-out window is the unit throughout: the same number of trades in
+        # a tenth of the window is ten times the rate, and ten times the reach.
+        self.write_store(count=60)
+        store = calibrate.Store(self.dir, make_config())
+
+        wide = calibrate.describe_pending(store, 4, 6.0, 30, 0.541, 0.6)
+        narrow = calibrate.describe_pending(store, 4, 0.6, 30, 0.541, 0.6)
+
+        self.assertIn("0.67 signals/hour", wide)
+        self.assertIn("6.67 signals/hour", narrow)
 
 
 class TestTheReading(CalibrateCase):
@@ -202,7 +271,7 @@ class TestTheAssumedPayoutIsStated(CalibrateCase):
         self.write_store(count=60)
         cfg = make_config()
 
-        _code, out = self.captured(cfg, str(self.dir), 0.0, 0.6, 92.0, 0.0)
+        _code, out = self.captured(cfg, str(self.dir), 0.0, 0.6, 92.0, 0)
 
         self.assertIn("52.1%", out, "1 / (1 + 0.92)")
         self.assertIn("assumption", out,

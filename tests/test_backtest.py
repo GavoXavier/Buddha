@@ -92,6 +92,20 @@ class TestStoreIndex(BacktestCase):
         store = backtest.Store(self.dir, cfg)
         self.assertEqual(len(store.buffer_for("AAA_otc", BASE + 40 * PERIOD)), 10)
 
+    def test_the_ceiling_is_the_cap_the_store_actually_trims_to(self):
+        # The same ``max_bars`` that caps the buffer caps the span, so a tool
+        # quoting this ceiling is quoting a measured fact rather than a guess.
+        self.write_store(self.straight(count=40))
+        store = backtest.Store(self.dir, make_config(max_bars=10))
+
+        self.assertAlmostEqual(store.ceiling_hours(), 10 * PERIOD / 3600.0)
+
+    def test_the_span_never_exceeds_the_ceiling(self):
+        self.write_store(self.straight(count=40))
+        store = backtest.Store(self.dir, make_config(max_bars=10))
+
+        self.assertLessEqual(store.span_hours(), store.ceiling_hours())
+
 
 class TestHowMuchOfTheStoreCanWarmTheTrendVeto(BacktestCase):
     """Reachability, which is the one dial effect the settings cannot show.
