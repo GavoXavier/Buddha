@@ -64,6 +64,14 @@ class JournalledTrade:
     confidence: float = 0.0
     votes: tuple[str, ...] = ()
     sent_at: Optional[float] = None
+    # What the engine could see when it judged this: which components were warm,
+    # what the trend read, how many bars the window held. Recorded so the record
+    # can be split by *the setup that produced it* and not only by outcome.
+    # Without it the most important question about the record — does the trend
+    # veto earn its keep? — cannot be asked of live data at all, because a signal
+    # judged while the EMA was short was produced by a different strategy wearing
+    # the same name, and afterwards the two are indistinguishable.
+    context: dict = dc_field(default_factory=dict)
     our_entry: Optional[float] = None
     our_exit: Optional[float] = None
     our_outcome: Optional[str] = None
@@ -125,8 +133,9 @@ class SignalJournal:
     def record_signal(self, *, asset: str, direction: str, entry_at: float,
                       expiry_at: float, payout: int = 0, score: int = 0,
                       confidence: float = 0.0, votes: Sequence[str] = (),
-                      sent_at: Optional[float] = None) -> None:
-        self._append({
+                      sent_at: Optional[float] = None,
+                      context: Optional[dict] = None) -> None:
+        record = {
             "kind": KIND_SIGNAL,
             "id": signal_id(asset, entry_at),
             "asset": asset,
@@ -138,7 +147,12 @@ class SignalJournal:
             "confidence": round(float(confidence), 4),
             "votes": list(votes),
             "sent_at": float(sent_at if sent_at is not None else time.time()),
-        })
+        }
+        if context:
+            # Written only when there is something to say, so a reader can tell
+            # "the engine was fully warm" from "this line predates the field".
+            record["context"] = dict(context)
+        self._append(record)
 
     def record_result(self, *, asset: str, entry_at: float, outcome: str,
                       entry_price: Optional[float] = None,
@@ -498,6 +512,7 @@ def _trade_from_signal(record: dict) -> Optional[JournalledTrade]:
     if not asset or not direction or entry_at is None or expiry_at is None:
         return None
     votes = record.get("votes") or ()
+    context = record.get("context")
     return JournalledTrade(
         asset=str(asset),
         direction=str(direction),
@@ -508,6 +523,7 @@ def _trade_from_signal(record: dict) -> Optional[JournalledTrade]:
         confidence=float(record.get("confidence") or 0.0),
         votes=tuple(str(v) for v in votes) if isinstance(votes, Iterable) else (),
         sent_at=_opt_float(record.get("sent_at")),
+        context=dict(context) if isinstance(context, dict) else {},
     )
 
 

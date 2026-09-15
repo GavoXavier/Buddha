@@ -80,6 +80,27 @@ class TestWriting(JournalCase):
         self.assertAlmostEqual(trade.our_entry, 1.0843)
         self.assertAlmostEqual(trade.our_exit, 1.0851)
 
+    def test_the_judgement_context_round_trips(self):
+        # Which engine produced a signal, not just how it ended: the trend is a
+        # veto, so a setup judged while its EMA was short came from a different
+        # strategy. Without this the record cannot be split by that afterwards.
+        self.signal(context={"bars": 24, "missing": ["trend"], "trend": None,
+                             "mtf": "up"})
+        trade = load_journal(self.path).trades[0]
+
+        self.assertEqual(trade.context["bars"], 24)
+        self.assertEqual(trade.context["missing"], ["trend"])
+        self.assertIsNone(trade.context["trend"])
+        self.assertEqual(trade.context["mtf"], "up")
+
+    def test_a_signal_with_no_context_says_so_by_omission(self):
+        self.signal()
+        line = json.loads(self.path.read_text(encoding="utf-8").strip())
+
+        self.assertNotIn("context", line, "a fully warm engine has nothing to add")
+        self.assertEqual(load_journal(self.path).trades[0].context, {},
+                         "and an older line without the field reads as unknown")
+
     def test_records_are_appended_not_rewritten(self):
         self.signal(entry_at=BASE)
         self.signal(entry_at=BASE + 60)

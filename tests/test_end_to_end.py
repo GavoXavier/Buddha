@@ -10,6 +10,7 @@ market replay in a couple of seconds.
 import asyncio
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from config import Config
@@ -30,10 +31,10 @@ PERIOD = 60
 SYMBOLS = ["EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc"]
 
 # The engine settings the bot ships with (see .env): two directional indicators
-# in agreement, a 5x confirmation on top. The cadence here is one minute rather
-# than the shipped five so a replay covers many trades in a few virtual hours;
-# the 5-minute loop is covered in tests/test_scheduler.py.
-ENGINE = SignalConfig(
+# in agreement, a 5x confirmation on top, and the trend as a veto. The cadence
+# here is one minute rather than the shipped five so a replay covers many trades
+# in a few virtual hours; the 5-minute loop is covered in tests/test_scheduler.py.
+SHIPPED_ENGINE = SignalConfig(
     bar_seconds=PERIOD,
     use_trend=True, trend_ema_len=50, trend_slope_bars=5,
     trend_min_distance_pct=0.05, trend_flat_min_score=3,
@@ -42,6 +43,17 @@ ENGINE = SignalConfig(
     use_rsi=True, use_macd=True, use_bb=True, use_stoch=True, use_sr=True,
     min_score=2, min_components=2,
 )
+
+# What the plumbing tests below run, and deliberately *not* the shipped settings.
+# With the trend gate warm this engine takes no trade at all in a 240-minute
+# replay of this simulated market (measured: 3 candidates, all vetoed, 0 signals)
+# — the trend is a veto, and a seeded random walk offers it little to agree with.
+# Every test here is about the path a signal takes once it exists — the message,
+# the journal, the settlement, the breaker — so it runs the engine with the veto
+# withdrawn, which is a documented setting (USE_TREND=0) rather than a fudge.
+# That the shipped engine *waits* for its gate is pinned in
+# TestTheShippedEngineWaitsForItsGate, and the gate itself in test_scheduler.py.
+ENGINE = replace(SHIPPED_ENGINE, use_trend=False)
 
 
 class RecordingSender:
@@ -151,8 +163,49 @@ class EndToEndCase(unittest.TestCase):
         return sorted(directory.glob("*.json")) if directory.exists() else []
 
 
+class TestTheShippedEngineWaitsForItsGate(EndToEndCase):
+    """The bot must not trade a variant of itself it was not configured as.
+
+    The trend is the one component that *vetoes*, so while its EMA is short the
+    engine runs with the veto removed — a different strategy wearing the same
+    name, and one the settings do not describe. It is the usual state rather than
+    a corner: at a 300s bar the EMA needs 56 bars, so a market must be tracked
+    without a hole for 4h40m before the gate exists at all, and on 2026-09-16 the
+    live store held 38 contiguous runs across 21 markets with only 3 deep enough.
+
+    Pinned end to end because the alternative is invisible: the bot goes quiet
+    and looks broken, or trades ungated and looks fine. Measured on this market
+    the shipped engine takes no trade in 240 minutes once the gate is warm — so
+    the assertion is on the *invariant* (nothing is signalled while the gate that
+    would judge it is absent), not on the count, which the dials will change.
+    """
+
+    @classmethod
+    def config(cls) -> Config:
+        return replace(super().config(), signal=SHIPPED_ENGINE)
+
+    def test_no_signal_was_judged_with_the_trend_gate_cold(self):
+        judged = load_journal(self.dir / "signals.jsonl").trades
+        for trade in judged:
+            self.assertNotIn(
+                "trend", trade.context.get("missing", ()),
+                f"{trade.asset} was signalled with no trend veto available — "
+                f"the journal says which engine produced it, and it was not this "
+                f"one: {trade.context}")
+
+    def test_the_gate_really_did_withhold_setups_in_this_run(self):
+        # Otherwise the test above passes for the wrong reason: a run in which
+        # the gate never came up would prove nothing about the gate.
+        self.assertGreater(self.out["scheduler"].cold_gate_skips, 0)
+
+
 class TestSignalCadence(EndToEndCase):
-    """The headline requirement: signals on the minute, for one-minute trades."""
+    """The headline requirement: signals on the minute, for one-minute trades.
+
+    Runs the engine with the trend veto withdrawn (``ENGINE``, i.e. USE_TREND=0):
+    what is under test is the path a signal takes once it exists, and with the
+    shipped veto this simulated market produces none to test it with.
+    """
 
     def test_the_run_produces_signals(self):
         self.assertGreaterEqual(len(self.signals), 1,

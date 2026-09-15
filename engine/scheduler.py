@@ -169,6 +169,11 @@ class MinuteScheduler:
         self.open_trades: list[OpenTrade] = []
         self.next_entry_at: Optional[int] = None
         self.signals_sent = 0
+        # Setups the last cycle refused because the trend EMA was not warm yet
+        # (``self.warming_markets``), and how many have been refused since the
+        # session began. The state, for /status; the total, for the record.
+        self.warming_markets: list[str] = []
+        self.cold_gate_skips = 0
         self._paused_until: float = 0.0
         self._warmup_notified_at: float = 0.0
         self._ready_notified = False
@@ -328,6 +333,9 @@ class MinuteScheduler:
             assets=len(self.symbols), healthy=len(healthy), bars=bars,
             bars_needed=max(r.bars_needed, 1), next_entry_at=self.next_entry_at,
             now=now) + note]
+        waiting = self.warming_text()
+        if waiting:
+            lines.append(waiting)
         # What the record is worth, next to the state of the bot. Read from the
         # journal on the spot rather than cached: this runs on a typed command,
         # not in the loop, and a stale EV is the one number that must not be.
@@ -335,6 +343,24 @@ class MinuteScheduler:
         if record:
             lines.append(f"📈 {record}")
         return "\n".join(lines)
+
+    def warming_text(self) -> str:
+        """Why the bot is quiet, when the reason is a gate that is not warm yet.
+
+        The last cycle's verdict, not a cumulative count: what a reader of
+        /status needs to know is whether the engine is being *held back* right
+        now, and by what. ``Bars: n/56`` says how far off a market is, but it is
+        the maximum across markets and says nothing about the veto that a short
+        EMA silently removes — which is the state most of a session is spent in.
+        """
+        if not self.warming_markets:
+            return ""
+        named = ", ".join(sorted(self.warming_markets)[:4])
+        more = (f" +{len(self.warming_markets) - 4} more"
+                if len(self.warming_markets) > 4 else "")
+        return (f"⏳ waiting on the trend EMA ({len(self.warming_markets)})"
+                f" — {named}{more}. Judged setups are refused until it is warm;"
+                f" USE_TREND=0 trades without it")
 
     def expected_value_text(self) -> str:
         """The per-trade return and its interval, or "" when there is no record.
@@ -392,10 +418,29 @@ class MinuteScheduler:
         per session from whatever the feed last published, and an empty one must
         not silence every market at once. Those keep the benefit of the doubt
         they were already given at selection time.
+
+        A market whose trend EMA is still warming is not judged at all. The
+        trend is the one component that *vetoes* rather than scores — a market
+        trending against the signal is refused outright — and while the EMA is
+        short there is no veto to apply, so what gets judged is not the setup
+        .env describes but the same engine with its trend filter removed. That is
+        a different strategy wearing the same name, and it is not the one the
+        settings claim to run.
+
+        It is not a rare state either. At a 300s bar the EMA needs 56 bars, so a
+        market must be tracked *without a hole* for 4h40m before the gate exists
+        at all; measured on 2026-09-16 the candle store held 38 contiguous runs
+        across 21 markets and only 3 of them were deep enough. The gate is the
+        exception rather than the rule, so a signal that reaches the journal has
+        probably been produced without it — which is why the journal now records
+        which engine produced each one (``context``) instead of leaving it to be
+        guessed at afterwards. USE_TREND=0 is how to ask for the ungated engine
+        deliberately.
         """
         closed_only = self.cadence.lead_seconds >= self.cadence.period
         candidates: list[Candidate] = []
         underpriced: list[tuple[str, int]] = []
+        warming: list[str] = []
         for symbol in healthy:
             series = self.market.track(symbol)
             if closed_only:
@@ -407,6 +452,9 @@ class MinuteScheduler:
             signal = evaluate(buffer, self.engine_config)
             if signal is None:
                 continue
+            if "trend" in signal.missing:
+                warming.append(symbol)
+                continue
             payout = self.payouts.get(symbol, 0)
             if 0 < payout < self.min_payout:
                 # Only a setup that would otherwise have been traded is worth
@@ -416,11 +464,36 @@ class MinuteScheduler:
                 continue
             candidates.append(Candidate(
                 asset=symbol, signal=signal, payout=payout, bars=len(buffer)))
+        self.warming_markets = sorted(warming)
+        self.cold_gate_skips += len(warming)
+        if warming:
+            log.info("%d setup(s) passed over: the trend EMA is not warm yet "
+                     "(%s)", len(warming), ", ".join(self.warming_markets))
         if underpriced:
             log.info("%d setup(s) passed over for paying under %d%%: %s",
                      len(underpriced), self.min_payout,
                      ", ".join(f"{s} {p}%" for s, p in underpriced))
         return candidates
+
+    def _judgement_context(self, winner: Candidate) -> dict:
+        """What the engine could see when it produced this setup.
+
+        Written into the journal so the record can be split by the setup that
+        produced a signal, not only by how it ended. The trend is the reason this
+        matters: it is a *veto*, so a signal judged while its EMA was short was
+        produced with the veto absent — a different strategy, and afterwards
+        indistinguishable from a gated one unless the state is recorded at the
+        moment. "Does the veto earn its keep?" is then a question the live record
+        can answer, on the data it is already collecting, instead of one only a
+        replay can ask.
+        """
+        signal = winner.signal
+        return {
+            "bars": int(winner.bars),
+            "missing": list(signal.missing),
+            "trend": signal.trend,
+            "mtf": signal.mtf,
+        }
 
     async def _send_signal(self, winner: Candidate, boundary: int,
                            candidate_count: int) -> None:
@@ -442,7 +515,7 @@ class MinuteScheduler:
                 entry_at=float(boundary), expiry_at=float(expiry_at),
                 payout=winner.payout, score=winner.signal.score,
                 confidence=winner.confidence, votes=winner.signal.votes,
-                sent_at=now)
+                sent_at=now, context=self._judgement_context(winner))
 
         log.info("[%s] SIGNAL %s %s score=%d conf=%.2f payout=%d%% votes=%s "
                  "(entry %s expiry %s) chosen from %d candidate(s)",

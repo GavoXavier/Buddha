@@ -547,6 +547,141 @@ class TestFullBarLead(unittest.TestCase):
                          "one trade live at every signal but the first")
 
 
+class TestASetupJudgedWithAColdTrendEmaIsPassedOver(unittest.TestCase):
+    """The trend is a veto, and a veto that is absent is a different engine.
+
+    While the EMA is short there is nothing to veto with, so what gets judged is
+    the same engine with its trend filter removed — not the setup .env describes.
+    That state is not brief: at a 300s bar it lasts 4h40m of *contiguous* tracking,
+    and on 2026-09-16 the candle store held 38 contiguous runs across 21 markets
+    with only 3 of them deep enough to warm the gate. So the gate is the
+    exception, and the silence it causes has to be legible rather than mysterious.
+    """
+
+    ASSET = "AAA_otc"
+
+    def setUp(self):
+        self.h = Harness(symbols=(self.ASSET,))
+        self.addCleanup(self.h.cleanup)
+
+    def engine(self, missing, trend=None):
+        """The engine stubbed out, with a chosen set of cold components."""
+        def _fake(candles, config):
+            return Signal(direction="CALL", score=2, votes=["FAKE"],
+                          price=candles[-1].close, time=candles[-1].time,
+                          confidence=0.6, missing=list(missing), trend=trend)
+        return unittest.mock.patch.object(sched_mod, "evaluate", _fake)
+
+    def play(self, closes=(99.0, 100.0, 101.0)):
+        return asyncio.run(self.h.play(list(closes)))
+
+    def test_a_cold_trend_ema_stops_the_signal(self):
+        with self.engine(["trend"]):
+            self.play()
+
+        self.assertEqual(self.h.sender.signals, [])
+        self.assertEqual(self.h.scheduler.open_trades, [])
+
+    def test_the_same_setup_is_traded_once_the_gate_is_warm(self):
+        with self.engine([]):
+            self.play()
+
+        self.assertEqual([s["asset"] for s in self.h.sender.signals], [self.ASSET])
+
+    def test_only_the_setup_is_passed_over_not_the_market(self):
+        with self.engine(["trend"]):
+            self.play()
+
+        self.assertGreater(self.h.market.track(self.ASSET).bar_count, 0,
+                           "it keeps ticking and keeps its bars: warming, not "
+                           "broken, and the moment the EMA is long enough it is "
+                           "judged again")
+
+    def test_the_silence_is_explained_in_the_log(self):
+        with self.engine(["trend"]):
+            with self.assertLogs("pocket.scheduler", level="INFO") as caught:
+                self.play()
+
+        self.assertTrue(
+            any("trend EMA is not warm" in line and self.ASSET in line
+                for line in caught.output),
+            f"why the bot went quiet should be in the log: {caught.output}")
+
+    def test_a_cold_component_that_is_not_a_veto_changes_nothing(self):
+        # RSI being short is a scoring problem the engine already weighs; only
+        # the veto has to stop the judgement, or every young market is dropped.
+        with self.engine(["RSI"]):
+            self.play()
+
+        self.assertEqual(len(self.h.sender.signals), 1)
+
+    def test_the_status_says_what_is_being_waited_for(self):
+        # A bot that has gone quiet for four hours must not look like a bot that
+        # has broken. Bars: n/56 gives the distance; this gives the reason.
+        with self.engine(["trend"]):
+            self.play()
+
+        self.assertIn("trend EMA", self.h.scheduler.warming_text())
+        self.assertIn(self.ASSET, self.h.scheduler.status_text())
+
+    def test_a_warm_cycle_drops_the_waiting_line_again(self):
+        # The state is the last cycle's, not a latch: once the EMA is long enough
+        # the engine is running as configured and /status must say so.
+        with self.engine(["trend"]):
+            self.play()
+        with self.engine([]):
+            self.play()
+
+        self.assertEqual(self.h.scheduler.warming_text(), "")
+        self.assertGreater(self.h.scheduler.cold_gate_skips, 0,
+                           "the count is cumulative, for the record")
+
+
+class TestASignalSaysWhichEngineProducedIt(SchedulerCase):
+    """The journal records the gate state, so the record can be split later.
+
+    Without it "does the trend veto earn its keep?" is unanswerable on live data:
+    a signal judged while the EMA was short came from a different strategy and
+    afterwards looks exactly like a gated one. That is the difference between
+    waiting two days for evidence and having it already.
+    """
+
+    ASSET = "AAA_otc"
+
+    def setUp(self):
+        super().setUp()
+        self.path = Path(self.h._tmp.name) / "signals.jsonl"
+        self.h.scheduler.journal = SignalJournal(self.path)
+
+    def test_the_context_names_the_cold_gate(self):
+        with unittest.mock.patch.object(
+                sched_mod, "evaluate",
+                lambda candles, config: Signal(
+                    direction="CALL", score=2, votes=["FAKE"],
+                    price=candles[-1].close, time=candles[-1].time,
+                    confidence=0.6, missing=[], trend="up")):
+            self.play([99.0, 100.0, 101.0])
+
+        trade = load_journal(self.path).trades[0]
+        self.assertEqual(trade.context["trend"], "up")
+        self.assertEqual(trade.context["missing"], [])
+        self.assertGreater(trade.context["bars"], 0,
+                           "how deep the window was is half the story")
+
+    def test_a_signal_with_a_cold_gate_is_never_written(self):
+        # The skipped setup must leave no trace in the record, or the split
+        # cannot answer what the gated engine did — only what it saw.
+        with unittest.mock.patch.object(
+                sched_mod, "evaluate",
+                lambda candles, config: Signal(
+                    direction="CALL", score=2, votes=["FAKE"],
+                    price=candles[-1].close, time=candles[-1].time,
+                    confidence=0.6, missing=["trend"], trend=None)):
+            self.play([99.0, 100.0, 101.0])
+
+        self.assertEqual(load_journal(self.path).trades, [])
+
+
 class TestJournalRecovery(SchedulerCase):
     """A restart must not drop the trade that was open when the last one died.
 
