@@ -98,9 +98,21 @@ def _format_expiry(minutes: int) -> str:
 
 
 def format_duration(seconds: int) -> str:
-    """A bar or expiry length as a short label: 60 -> '1m', 300 -> '5m', 45 -> '45s'."""
+    """A span as a short label: 60 -> '1m', 300 -> '5m', 45 -> '45s'.
+
+    Hours and minutes are combined rather than flattened into minutes, because
+    not every span this labels is a bar length: the trend veto's warm-up on a
+    300s bar is 280 minutes, and '280m' makes the reader do the division that
+    '4h40m' has already done. Only spans over an hour are affected, so every
+    bar and expiry label renders exactly as it did.
+    """
     if seconds and seconds % 3600 == 0:
         return f"{seconds // 3600}h"
+    if seconds >= 3600:
+        hours, rest = divmod(int(seconds), 3600)
+        if rest < 60:
+            return f"{hours}h{rest}s"
+        return f"{hours}h{rest // 60:02d}m"
     if seconds and seconds % 60 == 0:
         return f"{seconds // 60}m"
     return f"{seconds}s"

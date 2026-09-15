@@ -636,6 +636,57 @@ class TestASetupJudgedWithAColdTrendEmaIsPassedOver(unittest.TestCase):
         self.assertGreater(self.h.scheduler.cold_gate_skips, 0,
                            "the count is cumulative, for the record")
 
+    def test_the_wait_says_how_many_markets_could_end_it(self):
+        # "Waiting" on its own reads as a warm-up that is nearly over. This is the
+        # half that says whether it is: three bars in, against a gate that needs
+        # 56, nothing here can hold the veto — and on the live store it was 3 of
+        # 21, which is what made the wait worth questioning rather than sitting
+        # through.
+        with self.engine(["trend"]):
+            self.play()
+
+        text = self.h.scheduler.warming_text()
+
+        self.assertIn("0 of 1 market(s) hold the 56-bar (56m) unbroken run", text)
+
+    def test_the_horizon_reported_is_the_bar_length_it_really_is(self):
+        # 4h40m is the figure that explains the live muteness, and it is 56 bars
+        # only at a 300s bar. On the 1-minute cadence the same gate is 56m, so a
+        # hardcoded horizon would be wrong on one of the two.
+        self.h = Harness(symbols=(self.ASSET,),
+                         cadence=Cadence(period=300, expiry_seconds=300,
+                                         lead_seconds=300))
+        self.addCleanup(self.h.cleanup)
+        with self.engine(["trend"]):
+            self.play()
+
+        self.assertIn("(4h40m)", self.h.scheduler.warming_text())
+
+    def test_the_depth_reported_is_the_configured_gates_own(self):
+        # The count is only worth printing if it is about the gate actually
+        # configured: a shallower EMA is both a different depth and a different
+        # horizon, and both come from the settings rather than from a constant.
+        self.h.scheduler.engine_config = SignalConfig(
+            use_trend=True, trend_ema_len=1, trend_slope_bars=0)
+        with self.engine(["trend"]):
+            self.play()
+
+        text = self.h.scheduler.warming_text()
+
+        self.assertIn("1 of 1 market(s) hold the 2-bar (2m) unbroken run", text)
+
+    def test_every_judged_market_is_counted_not_only_the_refused_one(self):
+        # Otherwise the line would report the depth of the market that happened
+        # to have something to say, which is the one market guaranteed to be the
+        # exception rather than the rule.
+        self.h = Harness(symbols=(self.ASSET, "BBB_otc"))
+        self.addCleanup(self.h.cleanup)
+        with self.engine(["trend"]):
+            self.play()
+
+        self.assertEqual(self.h.scheduler.gate_markets, 2)
+        self.assertIn("0 of 2 market(s)", self.h.scheduler.warming_text())
+
 
 class TestASignalSaysWhichEngineProducedIt(SchedulerCase):
     """The journal records the gate state and the configuration behind it.

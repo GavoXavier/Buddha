@@ -46,7 +46,9 @@ from execution import UNPLACED, DemoBroker, Order
 from journal import SignalJournal, format_ev, load_journal
 from market.aggregator import MarketState
 from market.clock import Clock, RealClock
-from signals.engine import Candle, Readiness, SignalConfig, evaluate, readiness
+from signals.engine import (
+    Candle, Readiness, SignalConfig, component_bars, evaluate, readiness,
+)
 from signals.ranking import Candidate, describe, select_best
 from stats import StatsTracker
 from telegram.control import BotController
@@ -185,6 +187,14 @@ class MinuteScheduler:
         # session began. The state, for /status; the total, for the record.
         self.warming_markets: list[str] = []
         self.cold_gate_skips = 0
+        # Whether that refusal is a warm-up or the steady state: which markets
+        # hold a run deep enough to warm the veto at all, out of how many were
+        # judged, and how deep the run has to be. A held-back setup says the gate
+        # is cold on one market; only this says whether it is cold on nearly all
+        # of them, which is the difference between waiting and not bothering.
+        self.gate_holders: list[str] = []
+        self.gate_markets = 0
+        self.gate_needed = 0
         self._paused_until: float = 0.0
         self._warmup_notified_at: float = 0.0
         self._ready_notified = False
@@ -370,15 +380,28 @@ class MinuteScheduler:
         now, and by what. ``Bars: n/56`` says how far off a market is, but it is
         the maximum across markets and says nothing about the veto that a short
         EMA silently removes — which is the state most of a session is spent in.
+
+        The second line is what keeps the first from reading as a warm-up that is
+        nearly over. A refused setup names one market; how many markets hold a
+        deep-enough run says whether the gate is about to come up or is simply
+        not coming up — on 2026-09-16 that was 3 of 21, and the line that said
+        "waiting" was read for hours as though the wait would end.
         """
         if not self.warming_markets:
             return ""
         named = ", ".join(sorted(self.warming_markets)[:4])
         more = (f" +{len(self.warming_markets) - 4} more"
                 if len(self.warming_markets) > 4 else "")
-        return (f"⏳ waiting on the trend EMA ({len(self.warming_markets)})"
-                f" — {named}{more}. Judged setups are refused until it is warm;"
-                f" USE_TREND=0 trades without it")
+        lines = [f"⏳ waiting on the trend EMA ({len(self.warming_markets)})"
+                 f" — {named}{more}. Judged setups are refused until it is warm;"
+                 f" USE_TREND=0 trades without it"]
+        if self.gate_markets and self.gate_needed:
+            horizon = format_duration(self.gate_needed * self.cadence.period)
+            lines.append(
+                f"   Only {len(self.gate_holders)} of {self.gate_markets} "
+                f"market(s) hold the {self.gate_needed}-bar ({horizon}) unbroken "
+                f"run it needs.")
+        return "\n".join(lines)
 
     def expected_value_text(self) -> str:
         """The per-trade return and its interval, or "" when there is no record.
@@ -488,6 +511,8 @@ class MinuteScheduler:
         candidates: list[Candidate] = []
         underpriced: list[tuple[str, int]] = []
         warming: list[str] = []
+        deep: list[str] = []
+        gate_bars = component_bars(self.engine_config).get("trend", 0)
         for symbol in healthy:
             series = self.market.track(symbol)
             if closed_only:
@@ -496,6 +521,11 @@ class MinuteScheduler:
                 buffer = series.buffer_for_boundary(boundary)
             if len(buffer) < 2:
                 continue
+            # Counted before the engine is asked anything, because the question
+            # this answers is about the market rather than about the setup: a
+            # market with nothing to say is still one that cannot hold the veto.
+            if gate_bars and len(buffer) >= gate_bars:
+                deep.append(symbol)
             signal = evaluate(buffer, self.engine_config)
             if signal is None:
                 continue
@@ -513,6 +543,9 @@ class MinuteScheduler:
                 asset=symbol, signal=signal, payout=payout, bars=len(buffer)))
         self.warming_markets = sorted(warming)
         self.cold_gate_skips += len(warming)
+        self.gate_holders = sorted(deep)
+        self.gate_markets = len(healthy)
+        self.gate_needed = gate_bars
         if warming:
             log.info("%d setup(s) passed over: the trend EMA is not warm yet "
                      "(%s)", len(warming), ", ".join(self.warming_markets))

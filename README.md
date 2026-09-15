@@ -280,9 +280,11 @@ signals the bot had sent** were produced in exactly that state.
 
 So while the veto is unavailable the engine refuses the setup and says so, rather
 than trading a variant nobody configured. It is loud about it in two places —
-`/status` carries a `⏳ waiting on the trend EMA (n)` line, and the log reports
-each passing-over — and every journalled signal records which engine judged it,
-so gated and ungated signals can be told apart after the fact.
+`/status` carries a `⏳ waiting on the trend EMA (n)` line naming the markets whose
+setups were refused, with the count of markets that hold a deep-enough run beneath
+it, and the log reports each passing-over — and every journalled signal records
+which engine judged it, so gated and ungated signals can be told apart after the
+fact.
 
 **How reachable is it?** The EMA needs `TREND_EMA_LEN + TREND_SLOPE_BARS + 1`
 bars: 50 + 5 + 1 = **56**, which at 300-second bars is 4h40m of *hole-free*
@@ -361,7 +363,7 @@ POCKET/
 │   └── ranking.py        # picking one market out of many
 ├── data/                 # base.py, pocket_option.py, simulated.py
 ├── telegram/             # sender.py (formatting), control.py (/commands)
-└── tests/                # 540 tests, ~16 seconds, no network
+└── tests/                # 545 tests, ~20 seconds, no network
 ```
 
 ## Setup
@@ -432,10 +434,26 @@ the code:
 
 | Command | Effect |
 |---------|--------|
-| `/status` | markets live, bars warm, when the next entry is |
+| `/status` | markets live, bars warm, when the next entry is — plus why it is quiet, and what its record is worth |
 | `/stats` | win rate overall, best/worst markets, best hours |
 | `/pause` / `/resume` | stop and restart signalling |
 | `/stop` | shut the bot down cleanly (flushes candles and stats) |
+
+`/status` is where a silent bot explains itself, and it carries three statements
+that are easy to mistake for each other. `Bars: n/56` is the *distance* to warm —
+the maximum across markets, so it says nothing about any one market. The
+`⏳ waiting on the trend EMA (n)` line says a setup was actually **refused**, not
+merely that something is short. And the line under it — which on the live store on
+2026-09-16 read, over the 16 markets it was trading —
+
+```
+   Only 2 of 16 market(s) hold the 56-bar (4h40m) unbroken run it needs.
+```
+
+— says whether that wait is about to end or is the steady state, which is the
+difference between sitting through it and choosing `USE_TREND=0` deliberately.
+Without it, "waiting on the trend EMA" reads as a warm-up that is nearly over, and
+that reading was wrong for the whole of the session it was written in.
 
 ## Tests
 

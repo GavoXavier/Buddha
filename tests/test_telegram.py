@@ -74,6 +74,15 @@ class TestDurationLabels(unittest.TestCase):
             with self.subTest(seconds=seconds):
                 self.assertEqual(format_duration(seconds), label)
 
+    def test_spans_over_an_hour_combine_hours_and_minutes(self):
+        # The trend veto's warm-up is 56 bars — 4h40m at 300s, and 280m written
+        # as minutes. Anything over an hour is expressed in both, because these
+        # labels now carry warm-up waits and not only bar lengths.
+        for seconds, label in ((16800, "4h40m"), (5400, "1h30m"),
+                               (3660, "1h01m"), (3601, "1h1s"), (3540, "59m")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(format_duration(seconds), label)
+
     def test_expiry_strings_to_seconds(self):
         for text, seconds in (("1m", 60), ("5m", 300), ("1h", 3600), ("90s", 90),
                               ("2", 120), ("", 60)):
