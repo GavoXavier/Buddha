@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 from execution import UNPLACED, DemoBroker, Order
-from journal import SignalJournal
+from journal import SignalJournal, load_journal
 from market.aggregator import MarketState
 from market.clock import Clock, RealClock
 from signals.engine import Candle, Readiness, SignalConfig, evaluate, readiness
@@ -115,6 +115,8 @@ class OpenTrade:
     # the tick bars say. ``None`` means the broker has not answered yet.
     broker_outcome: Optional[str] = None
     broker: Optional[dict] = None
+    # Taken back from the journal at startup rather than opened by this process.
+    recovered: bool = False
 
 
 @dataclass
@@ -175,6 +177,7 @@ class MinuteScheduler:
     # -- main loop -----------------------------------------------------------
     async def run(self) -> None:
         """Loop forever, one decision per bar."""
+        self.recover_from_journal()
         await self._announce_startup()
         while not self.controller.stop_requested:
             now = self.clock.now()
@@ -189,6 +192,86 @@ class MinuteScheduler:
                 break
             await self.run_cycle(boundary)
             await self._announce_progress()
+
+    def recover_from_journal(self, now: Optional[float] = None) -> list[OpenTrade]:
+        """Pick up what the previous process left open, if the bars can prove it.
+
+        ``open_trades`` and ``last_signal_at`` live in memory only, so a restart
+        used to lose both. What that cost was measured on 2026-09-15: a signal
+        sent at 20:15 for the 20:15 entry, the process dying at 20:19, and the
+        trade never settled — no result in the journal, no outcome in the stats,
+        nothing in any log. It stayed the one unsettled signal in
+        ``signals.jsonl``, which is exactly what an unsettled signal is supposed
+        to mean, so the loss looked like a fact rather than a defect.
+
+        A signal is taken back only when the restored bars can still price it,
+        or when the bars it needs have not happened yet: an entry that is still
+        ahead is settled from the live feed exactly as it would have been, and
+        an exit that is still ahead likewise. Both prices are readings of bar
+        closes the feed really delivered, so where they exist the settlement is
+        the same one the original session would have produced — and where they
+        do not, the trade is left unsettled rather than given an outcome nobody
+        observed.
+
+        That is the honest limit, and it is why this cannot resurrect the 20:15
+        trade: the hole left by the shrinking universe had already taken its
+        bars off the disk before the process died.
+
+        The cooldown clocks are restored at the same time, so a restart cannot
+        signal a market the previous process had just signalled.
+        """
+        if self.journal is None:
+            return []
+        try:
+            loaded = load_journal(self.journal.path)
+        except OSError as exc:
+            log.warning("could not read %s to recover open trades: %s",
+                        self.journal.path, exc)
+            return []
+
+        now = self.clock.now() if now is None else now
+        for entry in loaded.trades:
+            sent = entry.sent_at if entry.sent_at is not None else entry.entry_at
+            if sent > self.last_signal_at.get(entry.asset, 0.0):
+                self.last_signal_at[entry.asset] = sent
+
+        adopted: list[OpenTrade] = []
+        unpriced: list[str] = []
+        for entry in loaded.unsettled:
+            series = self.market.track(entry.asset)
+            if entry.entry_at > now:
+                # Signalled but not yet entered — the bar it needs is ahead of
+                # us, not missing. A restart in the seconds between the message
+                # and the entry is the common case, and dropping it here would
+                # manufacture exactly the orphan this method exists to prevent.
+                entry_price = None
+            else:
+                entry_price = series.price_at_boundary(entry.entry_at)
+                if entry_price is None:
+                    unpriced.append(entry.id)
+                    continue
+            if entry.expiry_at <= now and series.price_at_boundary(entry.expiry_at) is None:
+                unpriced.append(entry.id)
+                continue
+            trade = OpenTrade(
+                asset=entry.asset, direction=entry.direction,
+                entry_at=entry.entry_at, expiry_at=entry.expiry_at,
+                confidence=entry.confidence, score=entry.score,
+                payout=entry.payout, votes=tuple(entry.votes),
+                entry_price=entry_price, recovered=True)
+            self.open_trades.append(trade)
+            adopted.append(trade)
+
+        if adopted:
+            log.info("recovered %d trade(s) the previous session left open: %s",
+                     len(adopted),
+                     ", ".join(f"{t.asset} {t.direction} entered {_stamp(t.entry_at)}"
+                               for t in adopted))
+        if unpriced:
+            log.warning("%d journalled signal(s) cannot be settled — their bars are "
+                        "no longer on disk, so there is no price to settle them at. "
+                        "Left unsettled: %s", len(unpriced), ", ".join(unpriced))
+        return adopted
 
     async def run_cycle(self, boundary: int) -> CycleResult:
         """One bar's work: settle, judge, send. Safe to call directly in tests."""
@@ -429,9 +512,10 @@ class MinuteScheduler:
                     settled_at=now, broker=trade.broker)
             self.open_trades.remove(trade)
             resolved.append(trade)
-            log.info("[%s] %s %s -> %s (entry %s exit %s)%s | %dW/%dL = %.0f%%",
+            log.info("[%s] %s %s -> %s (entry %s exit %s)%s%s | %dW/%dL = %.0f%%",
                      _stamp(trade.expiry_at), trade.asset, trade.direction, outcome,
                      entry_price, exit_price, self._broker_note(trade, label),
+                     " (recovered)" if trade.recovered else "",
                      self.stats.wins, self.stats.losses, self.stats.win_rate * 100)
 
             if self.sender is not None:
@@ -439,7 +523,10 @@ class MinuteScheduler:
                     await self.sender.send_confirmation(
                         trade.asset, trade.direction, outcome,
                         self.stats.wins, self.stats.losses, self.stats.win_rate,
-                        expiry_at=trade.expiry_at, streak=self._streak_label())
+                        expiry_at=trade.expiry_at, streak=self._streak_label(),
+                        note=(f"↩️ Settled after a restart "
+                              f"(entered {_stamp(trade.entry_at)})"
+                              if trade.recovered else ""))
                 except Exception as exc:
                     log.error("confirmation send failed: %s", exc)
 

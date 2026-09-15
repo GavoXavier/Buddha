@@ -75,7 +75,16 @@ class PocketOptionFeed(DataFeed):
         connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
         self._http_session = aiohttp.ClientSession(connector=connector)
 
-        self._client = PocketOptionClient(logger=False, http_session=self._http_session)
+        # The SDK's own reconnect is switched off, because this supervisor is
+        # the reconnector. Left on, it fights for the same seat: when the socket
+        # dropped, the SDK would silently reconnect the *old* client — a fresh
+        # session on the same SSID — while the watchdog was already tearing the
+        # session down, so the server briefly held two sessions for one account
+        # and the one just built was the one it refused. Observed as
+        # "ConnectionError: One or more namespaces failed to connect" on the
+        # reconnect that followed a flap (2026-09-15 21:47:20).
+        self._client = PocketOptionClient(logger=False, reconnection=False,
+                                          http_session=self._http_session)
         self._client.on.load_history_period_fast(self._on_history)
         self._client.on.update_close_value(self._on_ticks)
         # Clear any stale waiters left over from a previous (broken) connection.
@@ -103,6 +112,45 @@ class PocketOptionFeed(DataFeed):
     def client(self):
         """The live ``PocketOptionClient``, or None when not connected."""
         return self._client
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the Socket.IO transport is still up.
+
+        Checked on both layers because they can disagree: the Engine.IO socket
+        dies first and the namespaces above it are only torn down afterwards.
+
+        The two background loops are checked as well, because a socket can be
+        open and dead at once. On 2026-09-15 the write loop gave up at 21:46:01
+        after thirty seconds with nothing to send, and ``state`` still read
+        "connected" forty-five seconds later: the server had gone quiet, the
+        socket had not yet closed, and nothing could be sent over it — no
+        order, no pong to the ping that would have kept it open. Waiting for
+        the socket to notice costs the rest of that window, so a finished loop
+        ends the session instead. Engine.IO clears both attributes when it
+        resets, and only ever finishes them on a connection that is already
+        over, so a missing task is not evidence of anything.
+
+        Anything unexpected in the SDK's shape reads as "connected" — this is a
+        tripwire alongside the tick watchdog, not a replacement for it, so
+        failing open leaves the existing protection in place rather than
+        reconnecting a session that was working.
+        """
+        client = self._client
+        if client is None:
+            return False
+        sio = getattr(client, "sio", None)
+        if sio is None:
+            return True
+        eio = getattr(sio, "eio", None)
+        if eio is not None:
+            if getattr(eio, "state", "connected") != "connected":
+                return False
+            for name in ("write_loop_task", "read_loop_task"):
+                task = getattr(eio, name, None)
+                if task is not None and task.done():
+                    return False
+        return bool(getattr(sio, "connected", True))
 
     def _region(self):
         from pocket_option.constants import Regions

@@ -20,9 +20,11 @@ from pathlib import Path
 
 import engine.scheduler as sched_mod
 from engine.scheduler import Cadence, MinuteScheduler, next_boundary, outcome_of
+from journal import SignalJournal, load_journal
 from market.aggregator import MarketState
 from market.clock import VirtualClock
 from signals.engine import Signal, SignalConfig
+from signals.ranking import Candidate, eligible
 from stats import StatsTracker
 from telegram.control import BotController
 
@@ -53,10 +55,10 @@ class FakeSender:
         return {"ok": True}
 
     async def send_confirmation(self, asset, direction, outcome, wins, losses,
-                                win_rate, expiry_at=None, streak=""):
+                                win_rate, expiry_at=None, streak="", note=""):
         self.confirmations.append({"asset": asset, "direction": direction,
                                    "outcome": outcome, "expiry_at": expiry_at,
-                                   "win_rate": win_rate})
+                                   "win_rate": win_rate, "note": note})
         return {"ok": True}
 
     async def send_text(self, text):
@@ -534,6 +536,152 @@ class TestFullBarLead(unittest.TestCase):
         # book; after that every signal goes out with exactly one trade live.
         self.assertEqual(live_counts, [0] + [1] * 5,
                          "one trade live at every signal but the first")
+
+
+class TestJournalRecovery(SchedulerCase):
+    """A restart must not drop the trade that was open when the last one died.
+
+    Measured on 2026-09-15: a signal sent at 20:15 for the 20:15 entry, the
+    process dying at 20:19, and the trade never settled — no result in the
+    journal, no outcome in the stats, nothing in any log. The state that would
+    have settled it lived only in memory.
+    """
+
+    ASSET = "AAA_otc"
+
+    def setUp(self):
+        super().setUp()
+        self.path = Path(self.h._tmp.name) / "signals.jsonl"
+        self.journal = SignalJournal(self.path)
+        self.h.scheduler.journal = self.journal
+
+    def journal_a_signal(self, entry_at=BASE + 60, expiry_at=BASE + 120,
+                         sent_at=None):
+        self.journal.record_signal(
+            asset=self.ASSET, direction="CALL", entry_at=entry_at,
+            expiry_at=expiry_at, payout=85, score=3, confidence=0.6,
+            votes=("RSI", "BB"),
+            sent_at=entry_at - 10 if sent_at is None else sent_at)
+
+    def test_a_trade_the_bars_can_still_price_is_adopted_and_settled(self):
+        self.journal_a_signal()
+        self.h.feed(BASE + 60, 100.0)      # the bar that closed at the entry
+        self.h.feed(BASE + 120, 101.0)     # ...and the one that closed at expiry
+        self.h.feed(BASE + 180, 102.0)     # which closes only when the next opens
+        self.h.vc._now = BASE + 180
+
+        adopted = self.h.scheduler.recover_from_journal()
+
+        self.assertEqual([t.asset for t in adopted], [self.ASSET])
+        self.assertTrue(adopted[0].recovered)
+        self.assertEqual(adopted[0].entry_price, 100.0,
+                         "the price the original session would have used")
+
+        results = asyncio.run(self.h.scheduler.run_cycle(BASE + 240))
+        trade = results.resolved[0]
+        self.assertEqual((trade.entry_price, trade.exit_price), (100.0, 101.0))
+        self.assertEqual(self.h.stats.wins, 1, "the outcome reaches the record")
+        self.assertEqual(self.h.sender.confirmations[0]["outcome"], "WIN")
+        self.assertIn("after a restart", self.h.sender.confirmations[0]["note"])
+
+        # ...and the journal now has the result line it never got.
+        entry = [t for t in load_journal(self.path).trades
+                 if t.entry_at == BASE + 60]
+        self.assertEqual(len(entry), 1)
+        self.assertTrue(entry[0].settled, "the recovered trade is no longer an orphan")
+        self.assertEqual(entry[0].our_outcome, "WIN")
+
+    def test_a_trade_whose_bars_are_gone_is_left_unsettled(self):
+        # The honest limit: with no bars there is no price, and an outcome
+        # invented for it would be indistinguishable from a measured one.
+        self.journal_a_signal()
+        self.h.vc._now = BASE + 180
+
+        self.assertEqual(self.h.scheduler.recover_from_journal(), [])
+
+        loaded = load_journal(self.path)
+        self.assertEqual(len(loaded.unsettled), 1, "still visible as unsettled")
+        self.assertEqual(loaded.settled, [])
+
+    def test_a_trade_still_running_is_adopted_before_its_exit_exists(self):
+        self.journal_a_signal()
+        self.h.feed(BASE + 60, 100.0)
+        self.h.feed(BASE + 120, 99.0)       # closes the entry bar
+        self.h.vc._now = BASE + 90          # ...while the expiry is still ahead
+
+        adopted = self.h.scheduler.recover_from_journal()
+
+        self.assertEqual(len(adopted), 1)
+        self.assertEqual(adopted[0].entry_price, 100.0)
+        self.assertIsNone(adopted[0].exit_price, "the exit bar does not exist yet")
+
+        self.h.feed(BASE + 180, 98.0)       # now the exit bar closes too
+        self.h.vc._now = BASE + 130
+        results = asyncio.run(self.h.scheduler.run_cycle(BASE + 180))
+
+        self.assertEqual(results.resolved[0].exit_price, 99.0)
+        self.assertEqual(self.h.stats.losses, 1)
+
+    def test_a_trade_signalled_but_not_yet_entered_is_adopted(self):
+        # A restart in the seconds between the message and the entry — the
+        # commonest restart there is, since the signal goes out a whole bar
+        # before it enters. Its bars are ahead, not missing, and the live feed
+        # will produce them.
+        self.journal_a_signal(entry_at=BASE + 120, expiry_at=BASE + 180)
+        self.h.feed(BASE + 60, 100.0)
+        self.h.vc._now = BASE + 90          # the entry is still ahead
+
+        adopted = self.h.scheduler.recover_from_journal()
+
+        self.assertEqual(len(adopted), 1, "a signal ahead of us is not an orphan")
+        self.assertIsNone(adopted[0].entry_price, "filled in when the bar closes")
+
+        self.h.feed(BASE + 120, 101.0)      # the entry bar arrives
+        self.h.feed(BASE + 180, 102.0)      # ...and the exit bar closes
+        self.h.vc._now = BASE + 190
+        results = asyncio.run(self.h.scheduler.run_cycle(BASE + 240))
+
+        trade = results.resolved[0]
+        self.assertEqual((trade.entry_price, trade.exit_price), (101.0, 102.0))
+        self.assertEqual(self.h.stats.wins, 1)
+
+    def test_an_already_settled_signal_is_not_adopted_again(self):
+        self.journal_a_signal()
+        self.journal.record_result(asset=self.ASSET, entry_at=BASE + 60,
+                                   outcome="WIN", entry_price=100.0,
+                                   exit_price=101.0)
+        self.h.feed(BASE + 60, 100.0)
+        self.h.feed(BASE + 120, 101.0)
+        self.h.vc._now = BASE + 180
+
+        self.assertEqual(self.h.scheduler.recover_from_journal(), [])
+        self.assertEqual(self.h.scheduler.open_trades, [])
+        self.assertEqual(self.h.stats.wins, 0, "no second outcome is recorded")
+
+    def test_the_cooldown_survives_the_restart(self):
+        # last_signal_at is in memory too. Without it a restart would signal a
+        # market the previous process had just signalled.
+        self.journal_a_signal(entry_at=BASE + 60, expiry_at=BASE + 120,
+                              sent_at=BASE - 15)
+        self.h.vc._now = BASE - 15
+
+        self.h.scheduler.recover_from_journal()
+
+        self.assertEqual(self.h.scheduler.last_signal_at[self.ASSET], BASE - 15)
+        candidate = Candidate(
+            asset=self.ASSET,
+            signal=Signal(direction="CALL", score=3, votes=["FAKE"],
+                          price=100.0, time=BASE, confidence=0.6))
+        self.assertEqual(
+            eligible([candidate], self.h.scheduler.last_signal_at, BASE, 120.0), [],
+            "the market is still on cooldown")
+        self.assertEqual(
+            eligible([candidate], self.h.scheduler.last_signal_at, BASE + 200, 120.0),
+            [candidate], "...and comes off it on schedule")
+
+    def test_without_a_journal_there_is_nothing_to_recover(self):
+        self.h.scheduler.journal = None
+        self.assertEqual(self.h.scheduler.recover_from_journal(), [])
 
 
 if __name__ == "__main__":

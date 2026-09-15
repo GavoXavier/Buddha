@@ -11,6 +11,10 @@ records its schema version, bar period **and the feed it was built from**;
 anything that does not match the current configuration is discarded rather than
 mixed into the buffer.
 
+Writes are *additive*: a save unions the series it is given with the one already
+persisted, so a bar that has been watched is never lost to a later, shorter
+series. See ``save`` for why that is not merely tidy.
+
 That last one matters more than it looks. The period check stops 1-minute bars
 being read as 5-minute ones; the feed check stops *fabricated* bars being read as
 real ones. ``FEED=simulated`` writes to the same directory with the same symbols,
@@ -102,12 +106,46 @@ class CandleStore:
                 out[symbol] = candles
         return out
 
+    def _merge_with_disk(self, symbol: str, candles: Sequence[Candle]) -> list[Candle]:
+        """``candles`` unioned with the persisted series, by timestamp.
+
+        ``load`` is what filters by version, period and feed, so a store written
+        by a different configuration contributes nothing here and the caller's
+        series is written on its own — the same discarding rule as everywhere
+        else, applied rather than duplicated.
+
+        On a timestamp present in both, the caller's bar wins: it is the one
+        built from ticks this process received, and a closed bar never changes
+        anyway, so the choice only matters if a bar was somehow written twice.
+        """
+        by_time: dict[float, Candle] = {c.time: c for c in self.load(symbol)}
+        for candle in candles:
+            by_time[candle.time] = candle
+        return sorted(by_time.values(), key=lambda c: c.time)
+
     def save(self, symbol: str, candles: Sequence[Candle], force: bool = False) -> None:
-        """Write ``candles`` for ``symbol``, at most once per ``save_interval``."""
+        """Write ``candles`` for ``symbol``, at most once per ``save_interval``.
+
+        What is written is the series handed in *unioned with whatever is already
+        on disk*, not that series alone. A closed bar is immutable, so merging by
+        timestamp can only ever add bars.
+
+        It has to, because the live series is not monotonic in what it holds. A
+        gap longer than ``MAX_GAP_BARS`` makes the aggregator drop everything
+        before it — correctly, since an indicator window must not be left to span
+        an outage — and a plain overwrite would then write that truncation
+        through to disk. That turns a temporary blindness into permanent loss:
+        measured on 2026-09-15, one teardown flush after a churn-induced gap took
+        AUDUSD from 19 bars to 2, EURCHF 20 to 2 and GBPUSD 21 to 2, and no
+        later session could recover them. Refusing to read across a hole is a
+        judgement about *analysis*; deleting the bars is a judgement about
+        *history*, and the two do not have to be the same one.
+        """
         now = time.time()
         if not force and now - self._last_save.get(symbol, 0.0) < self.save_interval:
             return
         self._last_save[symbol] = now
+        merged = self._merge_with_disk(symbol, candles)[-self.max_bars:]
         doc = {
             "version": _SCHEMA_VERSION,
             "period": self.period,
@@ -115,7 +153,7 @@ class CandleStore:
             "asset": symbol,
             "saved_at": now,
             "candles": [[c.time, c.open, c.high, c.low, c.close]
-                        for c in candles[-self.max_bars:]],
+                        for c in merged],
         }
         path = self._path(symbol)
         tmp = path.with_suffix(".json.tmp")

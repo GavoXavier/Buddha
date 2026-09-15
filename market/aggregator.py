@@ -84,6 +84,17 @@ class CandleSeries:
         bucket = int(math.floor(ts / self.period) * self.period)
 
         if self._cur_bucket is None:
+            # Nothing is in progress: either this series is new, or it was just
+            # restored from disk and this is the first tick of the session. The
+            # restored bars can be older than the tolerance allows — a market
+            # that was not being subscribed has bars that stop well before the
+            # restart — and that hole is the same hole as any other. Left
+            # unchecked it was not: on 2026-09-15 a market restored with bars
+            # ending at 21:00 took its next tick at 21:45 and the two were read
+            # as one series, which put an RSI window across a 45-minute outage
+            # and produced a signal off it.
+            if self._closed:
+                self._note_gap(bucket, self._closed[-1].time)
             self._open_bucket(bucket, price)
         elif bucket == self._cur_bucket:
             if self._cur_finalized:
@@ -94,14 +105,25 @@ class CandleSeries:
             self._ticks += 1
         elif bucket > self._cur_bucket:
             self._close_bucket()
-            missing = (bucket - self._cur_bucket) // self.period - 1
-            if missing > 0:
-                self.gaps += 1
-                self.last_gap_seconds = bucket - self._cur_bucket
-                if missing > self.max_gap_bars:
-                    self._drop_broken_history(missing)
+            self._note_gap(bucket, self._cur_bucket)
             self._open_bucket(bucket, price)
         # bucket < current: a genuinely late tick, already accounted for.
+
+    def _note_gap(self, bucket: int, previous: float) -> None:
+        """Account for the hole between ``previous`` and ``bucket``.
+
+        Nothing is invented to fill it: the bars before a hole too wide to be
+        one series with what follows are dropped, exactly as they are when the
+        feed returns mid-session, so no indicator window is ever read across an
+        outage.
+        """
+        missing = (bucket - int(previous)) // self.period - 1
+        if missing <= 0:
+            return
+        self.gaps += 1
+        self.last_gap_seconds = bucket - previous
+        if missing > self.max_gap_bars:
+            self._drop_broken_history(missing)
 
     def _drop_broken_history(self, missing: int) -> None:
         """Forget every bar before a hole too long to be one series with them.
@@ -109,12 +131,30 @@ class CandleSeries:
         Called when the feed comes back after a gap. The bars after the hole are
         sound and are kept; the ones before it can never be contiguous with
         them, so an indicator window spanning the two would be reading an outage.
+
+        This narrows the *buffer*, never the record: the store writes additively,
+        so bars dropped here are still on disk and still count towards the
+        history a later session can restore. What is lost is only this session's
+        ability to read an indicator across the hole.
         """
         dropped = len(self._closed)
         self._closed.clear()
-        log.warning("%s: %d-minute hole in the feed — dropped %d bar(s) that "
-                    "cannot be one series with what follows, warming up again",
-                    self.symbol, missing, dropped)
+        log.warning("%s: %d bar(s) missing from the feed (%.0f min at %ds bars) — "
+                    "dropped %d bar(s) that cannot be one series with what "
+                    "follows, warming up again",
+                    self.symbol, missing, self._minutes(missing), self.period,
+                    dropped)
+
+    def _minutes(self, bars: int) -> float:
+        """Wall-clock length of ``bars`` missing buckets.
+
+        Both hole messages used to print the *bar* count with the word
+        "minutes". That was near enough at a 60-second period and wrong by 5x
+        once the period became 300: a 10-bar hole read as "a 10-minute hole"
+        when it was fifty minutes, which is how a two-hour outage came to look
+        like a blip while it was being diagnosed.
+        """
+        return bars * self.period / 60.0
 
     def _open_bucket(self, bucket: int, price: float) -> None:
         self._cur_bucket = bucket
@@ -207,17 +247,24 @@ class CandleSeries:
         A persisted series can hold a hole, because the process was not running
         or the feed died mid-session, so only the newest run of contiguous bars
         is restored. Without that, the first indicator windows after a restart
-        straddle the hole and read the whole outage as one bar's move.
+        straddle the hole and read the whole outage as one bar's move. A hole
+        between the newest persisted bar and the first tick of this session is
+        not visible here at all — nothing knows yet when that tick will come —
+        so ``add_tick`` makes the same judgement then.
+
+        The bars before the hole are left out of the *buffer*; they are not
+        erased. The store writes additively, so they remain on disk and a later
+        session that does have a contiguous run through them can still use them.
         """
         ordered = sorted(candles, key=lambda x: x.time)[-self.max_bars:]
         start = self._newest_contiguous_start(ordered)
         if start:
-            log.warning("%s: persisted bars span a %d-minute hole — restored "
-                        "only the %d bar(s) after it",
-                        self.symbol,
-                        int((ordered[start].time - ordered[start - 1].time)
-                            // self.period) - 1,
-                        len(ordered) - start)
+            missing = int(round((ordered[start].time - ordered[start - 1].time)
+                                / self.period)) - 1
+            log.warning("%s: persisted bars span %d missing bar(s) (%.0f min at "
+                        "%ds bars) — restored only the %d bar(s) after it",
+                        self.symbol, missing, self._minutes(missing),
+                        self.period, len(ordered) - start)
         for c in ordered[start:]:
             self._closed.append(c)
 

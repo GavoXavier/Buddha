@@ -200,12 +200,16 @@ def format_signal(signal: Signal, asset: str, expiry: str, entry_at: float,
 def format_confirmation(asset: str, direction: str, outcome: str,
                         wins: int, losses: int, win_rate: float,
                         expiry_at: Optional[float] = None,
-                        streak: str = "") -> str:
+                        streak: str = "",
+                        note: str = "") -> str:
     """Render the result of a completed trade.
 
     A refund and a failed order are neither wins nor losses, so they get their
     own mark and a note: the line below reports the tally, and a refund is not
     in it. Anything else would print a refund as ❌ LOSS.
+
+    ``note`` is a caller-supplied closing line for anything the result itself
+    cannot say — a settlement that only arrived after a restart, for instance.
     """
     emoji = _CALL_EMOJI if direction == "CALL" else _PUT_EMOJI
     label = "BUY" if direction == "CALL" else "SELL"
@@ -222,6 +226,8 @@ def format_confirmation(asset: str, direction: str, outcome: str,
         lines.append("(not counted in the win rate)")
     if streak:
         lines.append(f"🔥 {streak}")
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
@@ -346,10 +352,10 @@ class TelegramSender:
     async def send_confirmation(self, asset: str, direction: str, outcome: str,
                                 wins: int, losses: int, win_rate: float,
                                 expiry_at: Optional[float] = None,
-                                streak: str = "") -> dict:
+                                streak: str = "", note: str = "") -> dict:
         return await self.send(format_confirmation(
             asset, direction, outcome, wins, losses, win_rate,
-            expiry_at=expiry_at, streak=streak))
+            expiry_at=expiry_at, streak=streak, note=note))
 
     async def send_text(self, text: str) -> dict:
         return await self.send(text)

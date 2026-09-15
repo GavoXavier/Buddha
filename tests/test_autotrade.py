@@ -59,10 +59,10 @@ class FakeSender:
         return {"ok": True}
 
     async def send_confirmation(self, asset, direction, outcome, wins, losses,
-                                win_rate, expiry_at=None, streak=""):
+                                win_rate, expiry_at=None, streak="", note=""):
         self.confirmations.append({"asset": asset, "direction": direction,
                                    "outcome": outcome, "expiry_at": expiry_at,
-                                   "win_rate": win_rate})
+                                   "win_rate": win_rate, "note": note})
         return {"ok": True}
 
     async def send_text(self, text):

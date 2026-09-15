@@ -53,3 +53,16 @@ class DataFeed(ABC):
     def last_tick_at(self) -> float:
         """Epoch seconds of the most recent tick (0 if none yet)."""
         return getattr(self, "_last_tick_at", 0.0)
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the transport is still up.
+
+        The supervisor watches this as well as tick silence, because a dead
+        socket is knowable at once while tick silence has to be waited out: on
+        2026-09-15 engineio gave up on the connection ~8 seconds after the last
+        tick, but the watchdog only reacted 95 seconds after it, so most of
+        every flap cycle was spent in a session that could not have worked.
+        Feeds that cannot drop (the simulator) are always connected.
+        """
+        return True

@@ -113,6 +113,35 @@ class TestCandleSeries(unittest.TestCase):
         self.assertTrue(all(c.time >= BASE + 92 * 60 for c in series.closed()),
                         "the bars from before the outage were dropped")
 
+    def test_a_hole_is_reported_in_minutes_as_well_as_bars(self):
+        # Both messages used to print the *bar* count with the word "minutes",
+        # which was near enough at 60s bars and wrong by 5x at 300s: a 10-bar
+        # hole read as "a 10-minute hole" when it was fifty. A two-hour outage
+        # then looked like a blip for as long as it was being diagnosed.
+        vc = VirtualClock(start=BASE + 100 * 300)
+        series = CandleSeries("EURUSD_otc", 300, 100, vc)
+        for i in range(20):
+            series.add_tick(BASE + i * 300, 1.0)
+
+        with self.assertLogs("pocket.market", level="WARNING") as logs:
+            series.add_tick(BASE + 30 * 300, 1.5)   # 10 missing 5-minute bars
+
+        self.assertIn("10 bar(s) missing from the feed (50 min at 300s bars)",
+                      "\n".join(logs.output))
+
+    def test_the_restore_report_counts_bars_and_minutes(self):
+        vc = VirtualClock(start=BASE + 200 * 300)
+        series = CandleSeries("EURUSD_otc", 300, 100, vc)
+        stale = [Candle(BASE + i * 300, 1, 1, 1, 1) for i in range(12)]
+        fresh = [Candle(BASE + (92 + i) * 300, 1, 1, 1, 1) for i in range(3)]
+
+        with self.assertLogs("pocket.market", level="WARNING") as logs:
+            series.restore(stale + fresh)
+
+        # 81 buckets apart, so 80 of them never became bars: 400 minutes, not 80.
+        self.assertIn("span 80 missing bar(s) (400 min at 300s bars)",
+                      "\n".join(logs.output))
+
     def test_restore_keeps_an_unbroken_series_whole(self):
         vc = VirtualClock(start=BASE + 200 * 60)
         series = CandleSeries("EURUSD_otc", 60, 100, vc)
@@ -122,6 +151,73 @@ class TestCandleSeries(unittest.TestCase):
         series.restore(bars)
 
         self.assertEqual(series.bar_count, 15)
+
+    def _restore_then_resume(self, missing, period=60):
+        """A restored series, then the first tick ``missing`` bars later.
+
+        This is what a restart looks like from the series' point of view: the
+        restore has no idea when the next tick will arrive, so whether the two
+        are one series can only be judged when it does. Bars are aligned to the
+        period, as the store's are — a bucket is a multiple of the period, and
+        an unaligned bar in a test would make the arithmetic say something the
+        real series never does.
+        """
+        start = int(BASE // period * period)
+        resume = start + (20 + missing) * period
+        vc = VirtualClock(start=resume)
+        series = CandleSeries("EURUSD_otc", period, 100, vc)
+        series.restore([Candle(start + i * period, 1.0, 1.0, 1.0, 1.0)
+                        for i in range(20)])
+        series.add_tick(resume, 1.5)              # the session's first tick...
+        series.add_tick(resume + period, 1.6)     # ...and the next bar closes
+        return series, resume, start
+
+    def test_a_stale_restore_is_dropped_by_the_first_tick(self):
+        # A restored series can be arbitrarily old — a market that stopped being
+        # subscribed keeps its bars but gets no new ones. Live on 2026-09-15 a
+        # series ending at 21:00 took its next tick at 21:45, the two were read
+        # as one series, and an RSI window was put across a 45-minute outage:
+        # the signal sent off it was noise dressed as a setup.
+        for missing in (12, 92):
+            with self.subTest(outage_bars=missing):
+                series, resume, _ = self._restore_then_resume(missing)
+
+                self.assertEqual(series.gaps, 1)
+                self.assertEqual(series.bar_count, 1,
+                                 "only the bar after the hole survives")
+                self.assertEqual(series.closed()[0].time, resume)
+
+    def test_a_restore_resumed_within_tolerance_keeps_its_history(self):
+        # Ordinary restart: the bars stop a bar or two before the tick, which is
+        # a dropped packet, not a different series. Dropping the buffer here
+        # would cost the whole warm-up after every quick restart.
+        series, _, start = self._restore_then_resume(3)
+
+        self.assertEqual(series.bar_count, 21, "the 20 restored bars and the one after")
+        self.assertEqual(series.closed()[0].time, start)
+
+    def test_the_stale_restore_is_reported_in_minutes_and_bars(self):
+        # Eight missing 5-minute bars is forty minutes, and the twenty bars
+        # thrown away with them are worth saying out loud.
+        with self.assertLogs("pocket.market", level="WARNING") as logs:
+            series, _, _ = self._restore_then_resume(8, period=300)
+
+        self.assertEqual(series.bar_count, 1)
+        self.assertIn("8 bar(s) missing from the feed (40 min at 300s bars)",
+                      "\n".join(logs.output))
+        self.assertIn("dropped 20 bar(s)", "\n".join(logs.output))
+
+    def test_a_first_tick_inside_the_last_restored_bar_is_not_a_gap(self):
+        # The restart that lands back in the same bucket as the newest restored
+        # bar — the common case — must not be mistaken for an outage.
+        vc = VirtualClock(start=BASE + 19 * 60 + 30)
+        series = CandleSeries("EURUSD_otc", 60, 100, vc)
+        series.restore([Candle(BASE + i * 60, 1.0, 1.0, 1.0, 1.0) for i in range(20)])
+
+        series.add_tick(BASE + 19 * 60 + 30, 1.5)
+
+        self.assertEqual(series.gaps, 0)
+        self.assertEqual(series.bar_count, 20, "nothing was thrown away")
 
     def test_late_tick_for_closed_bar_is_dropped(self):
         self.series.add_tick(BASE, 1.10)
@@ -334,6 +430,55 @@ class TestCandleStore(unittest.TestCase):
         self.store.save("A_otc", [Candle(BASE, 1, 1, 1, 1)], force=True)
         out = self.store.load_all(["A_otc", "B_otc"])
         self.assertEqual(list(out), ["A_otc"])
+
+    def test_a_shorter_series_does_not_erase_the_bars_before_it(self):
+        # The aggregator drops every bar before a long hole, so the series it
+        # hands the store is legitimately truncated. Overwriting would write
+        # that truncation through to disk and turn temporary blindness into
+        # permanent loss: measured on 2026-09-15, one teardown flush after a
+        # churn-induced gap took AUDUSD from 19 bars to 2 and no later session
+        # could recover them.
+        self.store.save("EURUSD_otc",
+                        [Candle(BASE + i * 60, 1.0, 1.0, 1.0, 1.0) for i in range(20)],
+                        force=True)
+        self.store.save("EURUSD_otc",
+                        [Candle(BASE + (20 + i) * 60, 2.0, 2.0, 2.0, 2.0)
+                         for i in range(2)],
+                        force=True)
+
+        merged = self.store.load("EURUSD_otc")
+        self.assertEqual([c.time for c in merged],
+                         [BASE + i * 60 for i in range(22)])
+        self.assertEqual(merged[0].close, 1.0, "the older bars kept their values")
+
+    def test_a_re_saved_bar_replaces_the_persisted_one(self):
+        self.store.save("EURUSD_otc", [Candle(BASE, 1, 1, 1, 1)], force=True)
+        self.store.save("EURUSD_otc", [Candle(BASE, 9, 9, 9, 9)], force=True)
+
+        loaded = self.store.load("EURUSD_otc")
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].close, 9)
+
+    def test_the_merge_still_honours_max_bars(self):
+        store = CandleStore(self.dir, 60, 3)
+        store.save("X_otc", [Candle(BASE + i * 60, 1, 1, 1, 1) for i in range(3)],
+                   force=True)
+        store.save("X_otc", [Candle(BASE + (3 + i) * 60, 1, 1, 1, 1)
+                             for i in range(3)], force=True)
+
+        self.assertEqual([c.time for c in store.load("X_otc")],
+                         [BASE + 180, BASE + 240, BASE + 300])
+
+    def test_a_foreign_store_is_not_merged_into(self):
+        # The merge reads the disk through ``load``, so it inherits the same
+        # discarding rules: a save must not resurrect bars that the period or
+        # feed checks just rejected.
+        CandleStore(self.dir, 60, 100, feed="simulated").save(
+            "EURUSD_otc", [Candle(BASE, 1, 1, 1, 1)], force=True)
+        live = CandleStore(self.dir, 60, 100, feed="pocket_option")
+        live.save("EURUSD_otc", [Candle(BASE + 60, 2, 2, 2, 2)], force=True)
+
+        self.assertEqual([c.time for c in live.load("EURUSD_otc")], [BASE + 60])
 
 
 def meta(symbol, payout=85, is_otc=None, active=True):

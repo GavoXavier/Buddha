@@ -7,7 +7,9 @@
 .claude/
 
 # Runtime state and trading records — personal, not source
-bot.log*
+# (bot*.log* also catches bot.err.log and rotated copies: a log is not source,
+# and a log is the one artefact most likely to be committed by accident.)
+bot*.log*
 *.contaminated-*
 signals*.jsonl
 stats*.json

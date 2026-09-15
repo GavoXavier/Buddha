@@ -14,6 +14,7 @@ from pathlib import Path
 
 from config import Config
 from data import SimulatedFeed
+from data.base import DataFeed
 from engine.scheduler import MinuteScheduler, next_boundary
 from journal import load_journal
 from main import FeedStalled, trading_session, watch_feed
@@ -28,8 +29,10 @@ BASE = 1_700_000_040.0          # exactly on a minute boundary
 PERIOD = 60
 SYMBOLS = ["EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc"]
 
-# The settings the bot actually ships with (see .env): 1m bars, one signal per
-# minute, two directional indicators in agreement, a 5m confirmation on top.
+# The engine settings the bot ships with (see .env): two directional indicators
+# in agreement, a 5x confirmation on top. The cadence here is one minute rather
+# than the shipped five so a replay covers many trades in a few virtual hours;
+# the 5-minute loop is covered in tests/test_scheduler.py.
 ENGINE = SignalConfig(
     bar_seconds=PERIOD,
     use_trend=True, trend_ema_len=50, trend_slope_bars=5,
@@ -58,10 +61,10 @@ class RecordingSender:
         return {"ok": True}
 
     async def send_confirmation(self, asset, direction, outcome, wins, losses,
-                                win_rate, expiry_at=None, streak=""):
+                                win_rate, expiry_at=None, streak="", note=""):
         self.confirmations.append({"asset": asset, "direction": direction,
                                    "outcome": outcome, "expiry_at": expiry_at,
-                                   "win_rate": win_rate})
+                                   "win_rate": win_rate, "note": note})
         return {"ok": True}
 
     async def send_text(self, text):
@@ -311,6 +314,46 @@ class TestSessionLifecycle(EndToEndCase):
             await clock.advance(30.0, steps=60)
             self.assertFalse(task.done(), "a live feed must not trip the watchdog")
             await clock.advance(300.0, steps=300)
+            with self.assertRaises(FeedStalled):
+                await asyncio.wait_for(task, timeout=10.0)
+
+        asyncio.run(scenario())
+
+    def test_the_watchdog_catches_a_dropped_connection_at_once(self):
+        # Tick silence has to be waited out; a dead transport does not, and the
+        # difference is most of a flap cycle. On 2026-09-15 engineio gave up on
+        # the connection ~8s after the last tick, but the watchdog waited the
+        # full silence window and only reacted 95s after it.
+        cfg = self.config()
+
+        class DroppingFeed(DataFeed):
+            """A feed whose socket has gone, with ticks still recent."""
+
+            def __init__(self):
+                self.alive = True
+
+            @property
+            def is_connected(self):
+                return self.alive
+
+            async def connect(self): ...
+            async def close(self): ...
+            async def asset_meta(self): return {}
+            async def subscribe(self, symbols): ...
+            def set_tick_handler(self, handler): ...
+
+        async def scenario():
+            clock = VirtualClock(start=BASE)
+            market = MarketState(PERIOD, 100, 120, clock)
+            controller = BotController()
+            feed = DroppingFeed()
+            task = asyncio.create_task(
+                watch_feed(market, ["EURUSD_otc"], cfg, controller, clock, feed=feed))
+            await clock.advance(30.0, steps=60)
+            self.assertFalse(task.done())
+
+            feed.alive = False
+            await clock.advance(10.0, steps=20)
             with self.assertRaises(FeedStalled):
                 await asyncio.wait_for(task, timeout=10.0)
 

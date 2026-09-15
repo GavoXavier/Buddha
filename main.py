@@ -12,6 +12,11 @@ The reconnect loop is the outer ``while``: any feed failure — a dead socket, a
 silent stream, an expired SSID — tears the session down and starts a new one
 with exponential backoff. Candle history is restored from disk on each attempt,
 so a reconnect does not cost another hour of warm-up.
+
+The ladder resets only after a session that actually stayed up (see
+``HEALTHY_SESSION_SECONDS``). A feed that accepts connections and then dies
+seconds later is one outage, not a series of them, and backing off from it
+has to mean backing off.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 
 # Windows consoles default to cp1252, which can't print emoji. Force UTF-8 so
 # unicode in log output can never crash the process.
@@ -45,15 +51,64 @@ from telegram.sender import TelegramSender, configure_clock
 
 log = logging.getLogger("pocket")
 
-# How often the watchdog checks that at least one market is still ticking.
-WATCH_INTERVAL = 15.0
+# How often the watchdog checks the feed. Cheap — it reads a transport flag and
+# a timestamp — and it is the whole detection delay for a dropped connection,
+# so it is short.
+WATCH_INTERVAL = 5.0
 # Reconnect backoff bounds.
 BACKOFF_MIN = 5.0
 BACKOFF_MAX = 60.0
+# How long a session has to stay up before its ending counts as a new event
+# rather than a continuation of the one being backed off from. A socket that
+# connects and dies seconds later is not a recovery: resetting the ladder the
+# moment ``connect()`` returned meant a flapping feed retried every five
+# seconds forever, and the delays only ever grew while connecting was itself
+# the thing failing.
+HEALTHY_SESSION_SECONDS = 120.0
 
 
 class FeedStalled(RuntimeError):
     """No market has ticked recently — the session has to be rebuilt."""
+
+
+def healthy_session_seconds(period: int) -> float:
+    """How long a session must last before the reconnect ladder restarts for it.
+
+    One bar, or the floor, whichever is longer. A session that reached a
+    boundary did the thing this bot exists to do; anything shorter is the same
+    outage still failing, and its delay should keep growing. The floor is what
+    makes this hold at a one-minute bar and the period term is what makes it
+    hold at a five-minute one, where two minutes is less than a single bar.
+
+    The bar is one period and not several on purpose. This feed drops sessions
+    of its own accord every few minutes, and a threshold longer than that gap
+    would climb the ladder to its cap and hold it there — a minute of downtime
+    after every drop, forever, to defend against a refusal that is not
+    happening. Short sessions still climb, so a server that really will not
+    have us is still backed off from.
+    """
+    return max(HEALTHY_SESSION_SECONDS, float(period))
+
+
+def backoff_step(lived: float, failures: int, backoff: float,
+                 healthy: float = HEALTHY_SESSION_SECONDS) -> tuple[int, float, float]:
+    """How long to wait after a session that lasted ``lived`` seconds failed.
+
+    Returns ``(failures, delay, backoff)``: the new failure count, the delay to
+    sleep before the next attempt, and the delay to start from after that.
+
+    The ladder restarts only for a session that stayed up long enough to be one
+    — see ``healthy_session_seconds``. It used to restart the moment
+    ``connect()`` returned, which meant a feed that accepted connections and
+    then died seconds later retried every five seconds for as long as it kept
+    doing it. The delays only ever grew while connecting was itself what
+    failed, so the flapping case — the one that actually happened — never
+    backed off at all.
+    """
+    if lived >= healthy:
+        failures, backoff = 0, BACKOFF_MIN
+    failures += 1
+    return failures, backoff, min(backoff * 2, BACKOFF_MAX)
 
 
 # --------------------------------------------------------------------------
@@ -111,16 +166,64 @@ def resolve_symbols(cfg: Config, metas: dict[str, AssetMeta]) -> list[str]:
     return picked
 
 
+def resolve_universe(cfg: Config, metas: dict[str, AssetMeta],
+                     sticky: list[str]) -> list[str]:
+    """The markets for this session, held stable for the life of the process.
+
+    ``select_assets`` reads the *live* payout list, which the server republishes
+    on every connect, so resolving per session made the universe churn: 12 to 15
+    markets, not the same ones, several times an hour. Every market that dropped
+    out stopped receiving ticks, and a market with no ticks accumulates no bars
+    — the hole then trips ``MAX_GAP_BARS`` and its series warms up again from
+    nothing, which is what truncated the stored series on 2026-09-15 and left a
+    signal with no bars left to settle it against.
+
+    So the first resolved universe is kept. A market that later drops off the
+    feed simply goes stale and is skipped, exactly as any silent market is,
+    while the ones that stay keep every bar they have accumulated. Only the
+    membership is sticky; payouts are re-read each session and used fresh for
+    ranking, and a symbol the feed has stopped offering is let go rather than
+    subscribed to blind.
+
+    ``sticky`` is the caller's list, filled on the first call and reused after.
+    """
+    if not sticky:
+        sticky.extend(resolve_symbols(cfg, metas))
+        return list(sticky)
+
+    if not metas:
+        return list(sticky)
+    kept = [s for s in sticky if s in metas]
+    dropped = [s for s in sticky if s not in metas]
+    if dropped:
+        log.warning("the feed no longer offers %d market(s) held from earlier "
+                    "sessions: %s", len(dropped), ", ".join(dropped))
+    if not kept:
+        # Nothing survived — re-derive rather than trade an empty universe.
+        sticky.clear()
+        return resolve_universe(cfg, metas, sticky)
+    if kept != sticky:
+        sticky[:] = kept
+    return list(sticky)
+
+
 # --------------------------------------------------------------------------
 # watchdog
 # --------------------------------------------------------------------------
 async def watch_feed(market: MarketState, symbols: list[str], cfg: Config,
-                     controller: BotController, clock: Clock | None = None) -> None:
-    """Raise ``FeedStalled`` when no tracked market has ticked for too long.
+                     controller: BotController, clock: Clock | None = None,
+                     feed: DataFeed | None = None) -> None:
+    """Raise ``FeedStalled`` when the feed stops working.
 
-    A Socket.IO connection can stay open while the server quietly stops sending
-    updates — from the inside that looks exactly like a very quiet market, and
-    the bot would sit there sending nothing. This is the tripwire for it.
+    Two tripwires, because they catch different failures at very different
+    speeds. A Socket.IO connection can stay open while the server quietly stops
+    sending updates — from the inside that looks exactly like a very quiet
+    market, and the bot would sit there sending nothing; only silence can
+    detect that, so it is waited out. The other failure is a dead transport,
+    which the feed knows about immediately, and waiting out the silence window
+    for it was most of a flap cycle: on 2026-09-15 engineio aborted the
+    connection ~8 seconds after the last tick and the watchdog did not react
+    until 95 seconds after it.
     """
     clock = clock or RealClock()
     started = clock.now()
@@ -128,6 +231,8 @@ async def watch_feed(market: MarketState, symbols: list[str], cfg: Config,
     while not controller.stop_requested:
         await clock.sleep_until(clock.now() + WATCH_INTERVAL)
         now = clock.now()
+        if feed is not None and not feed.is_connected:
+            raise FeedStalled("the feed's connection dropped")
         freshest = min(
             (now - (market.track(s).last_tick_ts or started) for s in symbols),
             default=0.0)
@@ -145,11 +250,15 @@ async def watch_feed(market: MarketState, symbols: list[str], cfg: Config,
 async def trading_session(cfg: Config, feed: DataFeed, sender: TelegramSender | None,
                           stats: StatsTracker, controller: BotController,
                           status_holder: dict, clock: Clock | None = None,
-                          broker: DemoBroker | None = None) -> None:
+                          broker: DemoBroker | None = None,
+                          universe: list[str] | None = None) -> None:
     """Connect, warm up, and trade until something fails or /stop arrives."""
     clock = clock or RealClock()
     metas = await feed.asset_meta()
-    symbols = resolve_symbols(cfg, metas)
+    if universe is None:
+        symbols = resolve_symbols(cfg, metas)
+    else:
+        symbols = resolve_universe(cfg, metas, universe)
     payouts = {s: metas[s].payout for s in symbols if s in metas}
     log.info("trading %d markets: %s", len(symbols),
              format_universe(symbols, metas) or ", ".join(symbols))
@@ -190,7 +299,8 @@ async def trading_session(cfg: Config, feed: DataFeed, sender: TelegramSender | 
 
     tasks = [
         asyncio.create_task(scheduler.run(), name="scheduler"),
-        asyncio.create_task(watch_feed(market, symbols, cfg, controller, clock),
+        asyncio.create_task(watch_feed(market, symbols, cfg, controller, clock,
+                                       feed=feed),
                             name="watchdog"),
     ]
     if isinstance(feed, SimulatedFeed):
@@ -304,6 +414,9 @@ async def run(cfg: Config) -> None:
     if stats.total:
         log.info("record so far: %dW/%dL = %.0f%%", stats.wins, stats.losses,
                  stats.win_rate * 100)
+    if stats.legacy.total:
+        log.info("plus %dW/%dL held over from %s, kept out of that figure",
+                 stats.legacy.wins, stats.legacy.losses, cfg.legacy_stats_path)
 
     controller = BotController()
     status_holder: dict = {"scheduler": None}
@@ -333,17 +446,20 @@ async def run(cfg: Config) -> None:
 
     failures = 0
     backoff = BACKOFF_MIN
+    # The universe is resolved once and then held: see ``resolve_universe`` for
+    # why re-deriving it per reconnect costs bars.
+    universe: list[str] = []
+    healthy_after = healthy_session_seconds(cfg.candle_period)
     # A refused account is a standing condition, not an event: say so once
     # rather than on every reconnect.
     refusal_announced = False
     try:
         while not controller.stop_requested:
             feed = None
+            started = time.time()
             try:
                 feed = build_feed(cfg, broker)
                 await feed.connect()
-                failures = 0
-                backoff = BACKOFF_MIN
                 if broker is not None:
                     # Only now does the server's own answer about the account
                     # exist. This is the check that cannot be fooled by .env.
@@ -358,21 +474,23 @@ async def run(cfg: Config) -> None:
                             except Exception:
                                 pass
                 await trading_session(cfg, feed, sender, stats, controller,
-                                      status_holder, broker=broker)
+                                      status_holder, broker=broker,
+                                      universe=universe)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                failures += 1
-                delay = backoff
-                backoff = min(backoff * 2, BACKOFF_MAX)
-                log.warning("session failed (%s: %s) — reconnecting in %.0fs",
-                            type(exc).__name__, exc, delay)
+                lived = time.time() - started
+                failures, delay, backoff = backoff_step(lived, failures, backoff,
+                                                        healthy_after)
+                log.warning("session failed after %.0fs (%s: %s) — reconnecting in %.0fs",
+                            lived, type(exc).__name__, exc, delay)
                 # Tell the operator, but do not turn an outage into a flood:
                 # first failure, then once every ten attempts.
                 if sender is not None and (failures == 1 or failures % 10 == 0):
                     try:
                         await sender.send_text(
                             f"⚠️ {type(exc).__name__}: {exc}\n"
+                            f"After {lived:.0f}s up. "
                             f"Reconnecting in {delay:.0f}s (attempt {failures}).")
                     except Exception:
                         pass
