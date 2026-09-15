@@ -154,5 +154,55 @@ class TestEngine(unittest.TestCase):
         self.assertIsNone(evaluate(make_candles([1.0, 2.0]), cfg))
 
 
+class TestAConfigurationCanNameItself(unittest.TestCase):
+    """A record that cannot say which strategy produced it is not a record.
+
+    The dials decide what a signal *is*, so grouping a journal by them is the
+    only way to ask "does this dial earn its keep?" of live data. That needs a
+    name for a configuration that is stable across runs and cheap to compare.
+    """
+
+    def test_the_shipped_configuration_has_no_deltas(self):
+        self.assertEqual(SignalConfig().dials(), {})
+
+    def test_only_what_differs_from_the_defaults_is_reported(self):
+        dials = SignalConfig(use_trend=False, min_score=3).dials()
+
+        self.assertEqual(dials, {"use_trend": False, "min_score": 3})
+
+    def test_the_same_configuration_gets_the_same_name_every_time(self):
+        # ``hash()`` would fail this: its seed is randomised per process, so two
+        # runs would disagree and a record would be split for no reason.
+        one = SignalConfig(use_trend=False, trend_ema_len=20).fingerprint()
+        two = SignalConfig(trend_ema_len=20, use_trend=False).fingerprint()
+
+        self.assertEqual(one, two)
+        self.assertEqual(len(one), 8)
+
+    def test_two_configurations_that_differ_get_two_names(self):
+        self.assertNotEqual(SignalConfig().fingerprint(),
+                            SignalConfig(min_score=3).fingerprint())
+
+    def test_setting_a_dial_to_its_default_is_not_a_different_configuration(self):
+        # Otherwise a tidied .env would split the record in two.
+        self.assertEqual(SignalConfig(min_score=2).fingerprint(),
+                         SignalConfig().fingerprint())
+
+    def test_every_field_is_walked_so_none_can_escape_being_recorded(self):
+        # A field added to the config later must show up in a record as a delta
+        # without anyone remembering to add it here.
+        cfg = SignalConfig()
+        odd = {}
+        for name in cfg.__dataclass_fields__:
+            value = getattr(cfg, name)
+            if isinstance(value, bool):
+                odd[name] = not value
+            elif isinstance(value, (int, float)):
+                odd[name] = value + 1
+
+        self.assertEqual(set(SignalConfig(**odd).dials()),
+                         set(cfg.__dataclass_fields__))
+
+
 if __name__ == "__main__":
     unittest.main()

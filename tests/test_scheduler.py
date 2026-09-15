@@ -638,12 +638,14 @@ class TestASetupJudgedWithAColdTrendEmaIsPassedOver(unittest.TestCase):
 
 
 class TestASignalSaysWhichEngineProducedIt(SchedulerCase):
-    """The journal records the gate state, so the record can be split later.
+    """The journal records the gate state and the configuration behind it.
 
-    Without it "does the trend veto earn its keep?" is unanswerable on live data:
-    a signal judged while the EMA was short came from a different strategy and
-    afterwards looks exactly like a gated one. That is the difference between
-    waiting two days for evidence and having it already.
+    Without either, "does the trend veto earn its keep?" is unanswerable on live
+    data: a signal judged while the EMA was short came from a different strategy
+    and afterwards looks exactly like a gated one. The state alone is not enough
+    — under ``USE_TREND=0`` the trend is never consulted, so an ungated signal
+    and a gated one with a strong reading leave the same trace — which is why the
+    dials are written into the same context.
     """
 
     ASSET = "AAA_otc"
@@ -667,6 +669,22 @@ class TestASignalSaysWhichEngineProducedIt(SchedulerCase):
         self.assertEqual(trade.context["missing"], [])
         self.assertGreater(trade.context["bars"], 0,
                            "how deep the window was is half the story")
+
+    def test_the_context_names_the_configuration_that_judged_it(self):
+        with unittest.mock.patch.object(
+                sched_mod, "evaluate",
+                lambda candles, config: Signal(
+                    direction="CALL", score=2, votes=["FAKE"],
+                    price=candles[-1].close, time=candles[-1].time,
+                    confidence=0.6, missing=[], trend="up")):
+            self.play([99.0, 100.0, 101.0])
+
+        scheduler = self.h.scheduler
+        trade = load_journal(self.path).trades[0]
+        self.assertEqual(trade.config_id,
+                         scheduler.engine_config.fingerprint())
+        self.assertEqual(trade.context["dials"],
+                         scheduler.engine_config.dials())
 
     def test_a_signal_with_a_cold_gate_is_never_written(self):
         # The skipped setup must leave no trace in the record, or the split
@@ -1134,6 +1152,87 @@ class TestTheStatusLineStatesWhatTheRecordIsWorth(SchedulerCase):
         self.addCleanup(self.h.cleanup)
 
         self.assertNotIn("EV", self.h.scheduler.status_text())
+
+
+class TestTheStatusSaysWhoseRecordThisIs(SchedulerCase):
+    """An EV is a number about a *strategy*, and /status has to name it.
+
+    The failure this guards against is quiet by construction: an EV measured
+    under another engine is arithmetically identical to one measured under this
+    one, so nothing about the number looks wrong. The record was read for hours
+    as if it described the running strategy when it described the ungated one,
+    which is why the line carries the answer rather than leaving it to be
+    inferred from a settings file.
+    """
+
+    def record(self, pairs, **config):
+        """A journal as the bot writes it: (config_id, outcome) per settled trade."""
+        path = Path(self.h.tmpdir) / "signals.jsonl"
+        journal = SignalJournal(path)
+        for i, (config_id, outcome) in enumerate(pairs):
+            entry_at = BASE + i * 60
+            journal.record_signal(
+                asset="AAA_otc", direction="CALL", entry_at=entry_at,
+                expiry_at=entry_at + 60, payout=92,
+                context={"config_id": config_id} if config_id else None)
+            journal.record_result(asset="AAA_otc", entry_at=entry_at,
+                                  outcome=outcome, entry_price=1.0,
+                                  exit_price=1.1)
+        self.h = Harness(journal=journal, config=SignalConfig(**config))
+        self.addCleanup(self.h.cleanup)
+        return self.h.scheduler
+
+    def test_a_record_from_the_running_engine_needs_no_note(self):
+        mine = SignalConfig(use_trend=False).fingerprint()
+        sched = self.record([(mine, "WIN")], use_trend=False)
+
+        text = sched.expected_value_text()
+
+        self.assertIn("EV", text)
+        self.assertNotIn("not this engine's", text)
+
+    def test_a_mixed_record_that_includes_this_engine_is_still_this_engines(self):
+        # The average is over more than one strategy and the journal says so,
+        # but this engine is among them — which is the question /status asks.
+        mine = SignalConfig(use_trend=False).fingerprint()
+        sched = self.record([(mine, "WIN"), ("0therc0de", "LOSS")],
+                            use_trend=False)
+
+        text = sched.expected_value_text()
+
+        self.assertIn("2 configurations mixed", text)
+        self.assertNotIn("not this engine's", text)
+
+    def test_another_engines_record_says_so_and_names_the_running_one(self):
+        sched = self.record([("0therc0de", "WIN")], use_trend=False)
+
+        text = sched.expected_value_text()
+
+        self.assertIn("not this engine's", text)
+        self.assertIn("use_trend=False", text)
+
+    def test_it_counts_the_settled_trades_it_is_not_describing(self):
+        sched = self.record([("0therc0de", "WIN"), ("0therc0de", "LOSS"),
+                             ("0therc0de", "WIN")], use_trend=False)
+
+        text = sched.expected_value_text()
+
+        self.assertIn("3 settled trade(s) from 1 other configuration(s)", text)
+
+    def test_a_record_from_before_the_field_existed_is_its_own_answer(self):
+        # No config_id is not a missing value: it says which build wrote the
+        # line, so it answers the question rather than deferring it.
+        sched = self.record([("", "WIN"), ("", "LOSS")], use_trend=False)
+
+        text = sched.expected_value_text()
+
+        self.assertIn("none of its 2 settled trade(s) recorded a configuration",
+                      text)
+
+    def test_an_empty_record_gets_no_note(self):
+        sched = self.record([])
+
+        self.assertEqual(sched.expected_value_text(), "")
 
 
 if __name__ == "__main__":

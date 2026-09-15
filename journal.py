@@ -97,6 +97,19 @@ class JournalledTrade:
         return self.broker_outcome is not None
 
     @property
+    def config_id(self) -> str:
+        """Which engine configuration produced this signal, or "" if unrecorded.
+
+        Empty is not a missing value — it is a fact about the record. Every line
+        written before the field existed was produced by *some* configuration and
+        the journal cannot say which, so the number it contributes cannot be
+        attributed to a strategy. Kept as a named state rather than folded into
+        the others for the same reason the never-settled count is.
+        """
+        value = self.context.get("config_id")
+        return value if isinstance(value, str) else ""
+
+    @property
     def outcome_of_record(self) -> Optional[str]:
         """The outcome to report: the broker's when there is one, else ours.
 
@@ -305,7 +318,13 @@ class LoadedJournal:
         """
         returns: list[float] = []
         unpriced = unjudged = 0
+        by_config: dict[str, int] = {}
+        unattributed = 0
         for trade in self.settled:
+            if trade.config_id:
+                by_config[trade.config_id] = by_config.get(trade.config_id, 0) + 1
+            else:
+                unattributed += 1
             value = trade_return(trade)
             if value is None:
                 if trade.outcome_of_record == "WIN":
@@ -321,22 +340,25 @@ class LoadedJournal:
         # see rather than infer from a smaller n.
         unsettled = len(self.trades) - len(self.settled)
 
+        # Which engine configurations the average is over, most first, so the
+        # line can say when it is about more than one strategy.
+        configs = tuple(sorted(by_config.items(), key=lambda kv: (-kv[1], kv[0])))
+        counted = dict(unpriced=unpriced, unjudged=unjudged, unsettled=unsettled,
+                       configs=configs, unattributed=unattributed)
+
         n = len(returns)
         if not n:
-            return ExpectedValue(unpriced=unpriced, unjudged=unjudged,
-                                 unsettled=unsettled)
+            return ExpectedValue(**counted)
         mean = sum(returns) / n
         if n < 2:
             # One trade has no spread to estimate, so there is no interval to
             # print — only the number itself.
-            return ExpectedValue(n=n, mean=mean, unpriced=unpriced,
-                                 unjudged=unjudged, unsettled=unsettled)
+            return ExpectedValue(n=n, mean=mean, **counted)
         variance = sum((r - mean) ** 2 for r in returns) / (n - 1)
         stdev = math.sqrt(variance)
         half = Z_95 * stdev / math.sqrt(n)
         return ExpectedValue(n=n, mean=mean, stdev=stdev, low=mean - half,
-                             high=mean + half, unpriced=unpriced,
-                             unjudged=unjudged, unsettled=unsettled)
+                             high=mean + half, **counted)
 
     def between(self, start: float, end: float) -> "LoadedJournal":
         """Only the signals entered in ``[start, end]`` — the reconcile window."""
@@ -377,6 +399,13 @@ class ExpectedValue:
     # is not known", which is also why n is smaller than the number of signals the
     # bot has sent.
     unsettled: int = 0
+    # Which engine configurations the settled trades came from, as
+    # ``((fingerprint, count), ...)`` most first, and how many carry none at all.
+    # A record spanning more than one configuration is an average over
+    # strategies, and the number cannot be read as describing any one of them —
+    # which is a property of the record, not a reason to withhold the number.
+    configs: tuple[tuple[str, int], ...] = ()
+    unattributed: int = 0
 
     @property
     def excluded(self) -> int:
@@ -426,18 +455,18 @@ def format_ev(ev: ExpectedValue) -> str:
     Also free of ``<`` and ``>``: the status message is otherwise hand-written
     HTML, and an interval written as ``-0.2..+0.1`` needs no escaping.
     """
-    dropped = _exclusions(ev)
+    notes = ", ".join(part for part in (_exclusions(ev), _provenance(ev)) if part)
     if not ev.n:
         # Nothing priced. If trades were left out, name them: that is why there
         # is no number, and a silent drop would read as an empty record.
-        return f"EV unknown | {dropped}" if dropped else ""
+        return f"EV unknown | {notes}" if notes else ""
     if ev.low is None:
         text = f"EV {ev.mean:+.3f} per trade | n={ev.n}"
     else:
         text = (f"EV {ev.mean:+.3f} per trade | 95% CI "
                 f"{ev.low:+.2f}..{ev.high:+.2f} | n={ev.n}")
-    if dropped:
-        text += f" | {dropped}"
+    if notes:
+        text += f" | {notes}"
     return f"{text} | {ev.verdict}"
 
 
@@ -450,6 +479,22 @@ def _exclusions(ev: ExpectedValue) -> str:
         parts.append(f"{ev.unjudged} unreadable")
     if ev.unsettled:
         parts.append(f"{ev.unsettled} never settled")
+    return ", ".join(parts)
+
+
+def _provenance(ev: ExpectedValue) -> str:
+    """Which strategies the number is an average over, when it is more than one.
+
+    Not a caveat for its own sake. The dials decide what a signal *is*, so two
+    configurations are two strategies; an EV computed across both describes
+    neither, and the failure is silent — the arithmetic is identical and the
+    number looks exactly as solid as a single-strategy one.
+    """
+    parts = []
+    if len(ev.configs) > 1:
+        parts.append(f"{len(ev.configs)} configurations mixed")
+    if ev.unattributed:
+        parts.append(f"{ev.unattributed} from an unrecorded configuration")
     return ", ".join(parts)
 
 

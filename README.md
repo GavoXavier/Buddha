@@ -352,7 +352,7 @@ POCKET/
 │   └── ranking.py        # picking one market out of many
 ├── data/                 # base.py, pocket_option.py, simulated.py
 ├── telegram/             # sender.py (formatting), control.py (/commands)
-└── tests/                # 518 tests, ~16 seconds, no network
+└── tests/                # 537 tests, ~16 seconds, no network
 ```
 
 ## Setup
@@ -602,6 +602,50 @@ ones it can account for, so the line cannot drift from the record it was read
 from. Four permanently unsettleable orphans — signals whose bars are no longer on
 disk, so there is no price to settle them at — are the usual source, and the
 startup log names them.
+
+**Every number above is about *some* engine, and the line has to say which one.**
+This is the failure that took longest to see, because nothing about a wrong EV
+looks wrong. The 40-signal record was read for hours as if it described the
+running strategy. It did not: replaying the store reproduces **34 of the 40**
+journalled signals exactly — same market, same entry moment — with the trend veto
+switched **off**, and **1 of 40** with the shipped `USE_TREND=1`. All 40 were sent
+before the veto was deployed, so the record was a measurement of the ungated
+strategy and every sentence drawn from it was about a bot that was no longer
+running. The `context` written beside them said the same thing by a different
+route — 39 of the 40 carried a cold trend reading — which is the other half of the
+problem: the evidence was there, in a field nothing was reading.
+
+State alone could not have caught it. The `context` written beside each signal
+records what the engine could *see*, and with `USE_TREND=0` the trend is never
+consulted — so an ungated signal and a gated one with a strong reading leave the
+same trace, both with an empty `missing` and a trend field that says nothing about
+which engine ran. What identifies the strategy is the **configuration**, so that is
+what is now recorded: `config_id` (an 8-hex sha256 of the non-default dials —
+deliberately not `hash()`, whose per-process seed would rename the same strategy
+every run and split the record for no reason) and `dials`, the deltas from the
+shipped defaults, so the record can be split by setup without a settings file to
+consult.
+
+The line then says when it is not talking about the running engine. This is the
+live `/status` as it stood on 2026-09-16 — a record of 36 settled trades, none of
+which named a configuration, read by an engine whose own name is `7308e3d4`:
+
+```
+EV -0.114 per trade | 95% CI -0.41..+0.18 | n=36 | 4 never settled, 36 from an unrecorded configuration | no edge shown yet
+🧩 this record is not this engine's: none of its 36 settled trade(s) recorded a configuration. Running now: bar_seconds=300, min_components=2
+```
+
+The first line goes to the log as well, so it stays ASCII — an emoji does not
+encode in the codepage Windows opens a log stream in, and the whole line is lost
+rather than mangled. The `🧩` note is Telegram-only, which is why the same fact
+appears twice at two levels of detail: `N configurations mixed` (or the unrecorded
+count) in the log, and the note with the running dials in `/status`.
+
+An *unrecorded* configuration is an answer rather than a gap. A trade with no
+`config_id` came from a build that did not write one — the 40-signal record is
+exactly that — and saying so is what stops the next reader repeating the mistake,
+because "none of its 36 settled trades recorded a configuration" cannot be
+misread as "this is about the engine running now".
 
 **A signal-only bot grades its own homework.** Every outcome above is read from
 two bar closes this process aggregated from the broker's ticks. That is a

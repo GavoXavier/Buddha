@@ -360,19 +360,17 @@ class TestTheBrokerSide(JournalCase):
         self.assertAlmostEqual(trade.broker_profit, 0.85)
 
 
-class TestWhatTheRecordIsWorth(unittest.TestCase):
-    """The per-trade return, and the interval that says how little is known.
-
-    A win rate cannot be read on its own here, because the payout is not fixed:
-    the same 53% of wins loses money at a 92% payout (break-even 52.1%) and
-    makes it at 60% (break-even 62.5%). These tests are about the number that
-    *is* readable, and about the sample sizes at which it starts to mean
-    anything.
-    """
+class RecordCase(unittest.TestCase):
+    """Trades built by hand, as the journal writes them."""
 
     def trade(self, outcome, payout=0, broker_payout=None, **overrides):
         values = dict(asset="EURUSD_otc", direction="CALL", entry_at=BASE,
-                      expiry_at=BASE + 60, payout=payout, our_outcome=outcome)
+                      expiry_at=BASE + 60, payout=payout, our_outcome=outcome,
+                      # A trade as the journal writes one now: attributed to the
+                      # engine configuration that produced it. Tests about the
+                      # arithmetic want one strategy in the sample, so they get
+                      # one; provenance is tested on its own below.
+                      context={"config_id": "c0ffee01"})
         if broker_payout is not None:
             # The money's own answer, which is the outcome of record.
             values["broker_outcome"] = outcome
@@ -386,6 +384,17 @@ class TestWhatTheRecordIsWorth(unittest.TestCase):
         trades += [self.trade("LOSS", payout) for _ in range(losses)]
         trades += [self.trade("PUSH", payout) for _ in range(pushes)]
         return LoadedJournal(trades=trades)
+
+
+class TestWhatTheRecordIsWorth(RecordCase):
+    """The per-trade return, and the interval that says how little is known.
+
+    A win rate cannot be read on its own here, because the payout is not fixed:
+    the same 53% of wins loses money at a 92% payout (break-even 52.1%) and
+    makes it at 60% (break-even 62.5%). These tests are about the number that
+    *is* readable, and about the sample sizes at which it starts to mean
+    anything.
+    """
 
     def test_a_win_pays_its_payout_and_a_loss_takes_the_stake(self):
         ev = self.sample(wins=1, losses=1).expected_value()
@@ -570,6 +579,78 @@ class TestWhatTheRecordIsWorth(unittest.TestCase):
         self.assertEqual(ev.n, 2)
         self.assertAlmostEqual(ev.mean, -0.04)
         self.assertIn("n=2", format_ev(ev))
+
+
+class TestTheRecordSaysWhichEngineItIsAbout(RecordCase):
+    """A number averaged over two strategies is a number about neither.
+
+    The dials decide what a signal *is*, so an EV spanning two configurations
+    describes no engine that ran. Nothing in the arithmetic can reveal that — the
+    mean is just as solid-looking either way — so the line has to say it.
+    """
+
+    def attributed(self, outcome, config_id, payout=92):
+        return self.trade(outcome, payout, context={"config_id": config_id})
+
+    def test_one_configuration_says_nothing_extra(self):
+        loaded = LoadedJournal(trades=[self.attributed("WIN", "aaaa1111"),
+                                       self.attributed("LOSS", "aaaa1111")])
+
+        line = format_ev(loaded.expected_value())
+
+        self.assertNotIn("configuration", line)
+        self.assertNotIn("mixed", line)
+
+    def test_two_configurations_are_called_mixed(self):
+        loaded = LoadedJournal(trades=[self.attributed("WIN", "aaaa1111"),
+                                       self.attributed("LOSS", "bbbb2222")])
+
+        ev = loaded.expected_value()
+
+        self.assertIn("2 configurations mixed", format_ev(ev))
+        self.assertEqual(ev.configs, (("aaaa1111", 1), ("bbbb2222", 1)))
+
+    def test_the_configurations_are_listed_largest_first(self):
+        loaded = LoadedJournal(trades=[self.attributed("WIN", "aaaa1111"),
+                                       self.attributed("LOSS", "aaaa1111"),
+                                       self.attributed("WIN", "bbbb2222")])
+
+        self.assertEqual(loaded.expected_value().configs,
+                         (("aaaa1111", 2), ("bbbb2222", 1)))
+
+    def test_a_signal_with_no_recorded_configuration_is_named(self):
+        # Every line written before the field existed is in this state, and the
+        # point of naming it is that those signals were produced by *some*
+        # strategy the journal cannot identify.
+        loaded = LoadedJournal(trades=[self.trade("WIN", 92, context={}),
+                                       self.trade("LOSS", 92, context={})])
+
+        ev = loaded.expected_value()
+
+        self.assertEqual(ev.unattributed, 2)
+        self.assertEqual(ev.configs, ())
+        self.assertIn("2 from an unrecorded configuration", format_ev(ev))
+
+    def test_a_config_id_of_the_wrong_type_is_not_a_configuration(self):
+        # The file is written by a process that can be killed mid-write, so a
+        # field can be anything. A number is not a fingerprint.
+        trade = self.trade("WIN", 92, context={"config_id": 17})
+
+        self.assertEqual(trade.config_id, "")
+
+    def test_an_unsettled_signal_does_not_count_towards_either(self):
+        # Nothing about a trade that never settled can be attributed: it has no
+        # outcome to attribute.
+        loaded = LoadedJournal(trades=[self.attributed("WIN", "aaaa1111"),
+                                       self.trade("UNKNOWN", 92, our_outcome=None,
+                                                  context={"config_id": ""})])
+
+        ev = loaded.expected_value()
+
+        self.assertEqual(ev.n, 1)
+        self.assertEqual(ev.configs, (("aaaa1111", 1),))
+        self.assertEqual(ev.unattributed, 0)
+        self.assertIn("1 never settled", format_ev(ev))
 
 
 if __name__ == "__main__":

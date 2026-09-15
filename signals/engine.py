@@ -30,6 +30,8 @@ trivially unit-testable. Cooldowns and cadence live in the caller.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -116,6 +118,33 @@ class SignalConfig:
     # Vote components that must have real data before a signal may fire.
     min_components: int = 1
     min_confidence: float = 0.0
+
+    def dials(self) -> dict:
+        """The settings that differ from this dataclass's defaults.
+
+        Only what differs, because that is what a reader of a journalled signal
+        needs: the shipped values are in the file, so a line that says
+        ``{"use_trend": False}`` is reporting "the trend veto was off" and not
+        forty identical rows. Two configurations with the same deltas are the same
+        strategy, which is exactly what ``fingerprint`` relies on.
+        """
+        base = SignalConfig()
+        return {name: getattr(self, name) for name in self.__dataclass_fields__
+                if getattr(self, name) != getattr(base, name)}
+
+    def fingerprint(self) -> str:
+        """A short, stable name for this configuration, for grouping a record.
+
+        Deliberately not ``hash()``: its seed is randomised per process, so the
+        same configuration would get a different name in every run and a record
+        grouped by it would be split for no reason. This one is a digest of the
+        canonical JSON of ``dials()``, so it depends only on the values.
+
+        It is a grouping key, not a display string — the deltas themselves are
+        recorded beside it, so nothing ever has to invert this.
+        """
+        canon = json.dumps(self.dials(), sort_keys=True, default=str)
+        return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:8]
 
 
 @dataclass

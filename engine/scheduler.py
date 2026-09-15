@@ -385,6 +385,12 @@ class MinuteScheduler:
 
         A read failure is not worth an exception on a status command — the bot
         is fine, only the reporting is.
+
+        The record is a number about *some* engine, and the question a reader of
+        /status actually has is whether it is about the one running. So when the
+        running configuration is not among the ones the settled trades came from,
+        the line says so: an EV measured under a different strategy is the most
+        misleading number on the screen, because nothing about it looks different.
         """
         if self.journal is None:
             return ""
@@ -394,7 +400,30 @@ class MinuteScheduler:
             log.warning("could not read %s for the record: %s",
                         self.journal.path, exc)
             return ""
-        return format_ev(loaded.expected_value())
+        ev = loaded.expected_value()
+        return "\n".join(part for part in (format_ev(ev), self._engine_note(ev))
+                         if part)
+
+    def _engine_note(self, ev) -> str:
+        """Whether this record is the running engine's, and if not, whose."""
+        mine = self.engine_config.fingerprint()
+        if any(config_id == mine for config_id, _count in ev.configs):
+            return ""
+        settled = sum(count for _cid, count in ev.configs) + ev.unattributed
+        if not settled:
+            return ""
+        running = ", ".join(f"{name}={value}"
+                            for name, value in
+                            (self.engine_config.dials() or {"dials": "shipped"})
+                            .items()) or "shipped settings"
+        if ev.configs:
+            whose = (f"{settled} settled trade(s) from {len(ev.configs)} other "
+                     f"configuration(s)")
+        else:
+            whose = (f"none of its {settled} settled trade(s) recorded a "
+                     f"configuration")
+        return (f"🧩 this record is not this engine's: {whose}. Running now: "
+                f"{running}")
 
     # -- internals -----------------------------------------------------------
     def _blocked(self, now: float) -> bool:
@@ -494,7 +523,7 @@ class MinuteScheduler:
         return candidates
 
     def _judgement_context(self, winner: Candidate) -> dict:
-        """What the engine could see when it produced this setup.
+        """What the engine could see, and what it was told, when it judged this.
 
         Written into the journal so the record can be split by the setup that
         produced a signal, not only by how it ended. The trend is the reason this
@@ -504,6 +533,14 @@ class MinuteScheduler:
         moment. "Does the veto earn its keep?" is then a question the live record
         can answer, on the data it is already collecting, instead of one only a
         replay can ask.
+
+        The *state* is not enough on its own, which is why the configuration is
+        here too. Measured on 2026-09-16 by replaying the store: 34 of the 40
+        signals the bot had sent were reproduced exactly by the engine with
+        ``USE_TREND=0`` and one by the engine the record now describes — the
+        record had been produced by a different strategy from the one running,
+        and no field in it said so. An average over two strategies is a number
+        about neither.
         """
         signal = winner.signal
         return {
@@ -511,6 +548,14 @@ class MinuteScheduler:
             "missing": list(signal.missing),
             "trend": signal.trend,
             "mtf": signal.mtf,
+            # What the engine was *told*, as opposed to what it could see above.
+            # The state alone cannot identify the strategy: with USE_TREND=0 the
+            # trend is never consulted, so a signal from the ungated engine and
+            # one from a gated engine with a strong reading both arrive with
+            # nothing in ``missing`` and a trend field that says nothing about
+            # which engine ran. The configuration is the only thing that can say.
+            "config_id": self.engine_config.fingerprint(),
+            "dials": self.engine_config.dials(),
         }
 
     async def _send_signal(self, winner: Candidate, boundary: int,
