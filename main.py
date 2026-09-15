@@ -22,6 +22,7 @@ has to mean backing off.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -167,8 +168,8 @@ def resolve_symbols(cfg: Config, metas: dict[str, AssetMeta]) -> list[str]:
 
 
 def resolve_universe(cfg: Config, metas: dict[str, AssetMeta],
-                     sticky: list[str]) -> list[str]:
-    """The markets for this session, held stable for the life of the process.
+                     sticky: list[str], target: int = 0) -> list[str]:
+    """The markets for this session, held stable for the life of the bot.
 
     ``select_assets`` reads the *live* payout list, which the server republishes
     on every connect, so resolving per session made the universe churn: 12 to 15
@@ -186,6 +187,17 @@ def resolve_universe(cfg: Config, metas: dict[str, AssetMeta],
     subscribed to blind.
 
     ``sticky`` is the caller's list, filled on the first call and reused after.
+    ``target`` is how many markets to hold. It matters because of what a restart
+    used to cost: this list lived in a variable, so every restart re-derived it,
+    and a market that was not chosen the second time kept its bars on disk and
+    received no more. Measured on 2026-09-16, five of the twenty-one stored
+    markets were in exactly that state — and they were not a random five: they
+    were *every market that had produced a signal*, including the second most
+    prolific, because a market signals when its series is deep, and depth comes
+    from the very continuity the re-derivation threw away. A restart is the same
+    decision resumed, so the list is persisted (``load_universe``) and the
+    departures are refilled here — keeping the *size* stable, so a market the
+    feed has really dropped cannot slowly starve the session.
     """
     if not sticky:
         sticky.extend(resolve_symbols(cfg, metas))
@@ -202,9 +214,70 @@ def resolve_universe(cfg: Config, metas: dict[str, AssetMeta],
         # Nothing survived — re-derive rather than trade an empty universe.
         sticky.clear()
         return resolve_universe(cfg, metas, sticky)
+    if len(kept) < target:
+        kept += _replacements(cfg, metas, kept, target - len(kept))
     if kept != sticky:
         sticky[:] = kept
     return list(sticky)
+
+
+def _replacements(cfg: Config, metas: dict[str, AssetMeta], held: list[str],
+                  want: int) -> list[str]:
+    """Fresh markets to stand in for the ones the feed has let go.
+
+    Kept as small as the job: the universe changes a member only when it has
+    to, so nothing here is a re-selection. Payouts are read live for this and
+    used once — which is the point at which they are least trustworthy, and the
+    reason the count is taken from what was already chosen rather than from
+    whatever the list looks like today.
+    """
+    try:
+        fresh = [s for s in resolve_symbols(cfg, metas) if s not in held]
+    except ConfigError as exc:
+        # Every market is under the payout floor while the ones already held
+        # are not. Nothing survives to replace them with, and that is not a
+        # reason to end the session.
+        log.warning("not refilling the universe: %s", exc)
+        return []
+    added = fresh[:want]
+    if added:
+        log.info("%d market(s) joined the universe to keep it at %d: %s",
+                 len(added), len(held) + len(added), ", ".join(added))
+    return added
+
+
+def load_universe(path: str) -> tuple[list[str], int]:
+    """The markets held from earlier sessions, and how many to keep.
+
+    ``([], 0)`` when there is nothing readable, which is what a first run looks
+    like. A cache that cannot be read is not a reason to refuse to start: the
+    universe is re-derived instead, which is where the bot would have been
+    without this file at all.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return [], 0
+    symbols = data.get("symbols") if isinstance(data, dict) else data
+    target = data.get("target") if isinstance(data, dict) else 0
+    if not isinstance(symbols, list):
+        return [], 0
+    kept = [s for s in symbols if isinstance(s, str)]
+    want = target if isinstance(target, int) and target > 0 else len(kept)
+    return kept, want
+
+
+def save_universe(path: str, symbols: list[str], target: int) -> None:
+    """Write the membership. Failing to is worth a line, not a shutdown."""
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"symbols": list(symbols), "target": int(target)}, fh,
+                      indent=2)
+            fh.write("\n")
+    except OSError as exc:
+        log.warning("could not write %s (%s) - the universe will be derived "
+                    "from the feed's list on the next start", path, exc)
 
 
 # --------------------------------------------------------------------------
@@ -251,14 +324,22 @@ async def trading_session(cfg: Config, feed: DataFeed, sender: TelegramSender | 
                           stats: StatsTracker, controller: BotController,
                           status_holder: dict, clock: Clock | None = None,
                           broker: DemoBroker | None = None,
-                          universe: list[str] | None = None) -> None:
+                          universe: list[str] | None = None,
+                          universe_target: int = 0) -> None:
     """Connect, warm up, and trade until something fails or /stop arrives."""
     clock = clock or RealClock()
     metas = await feed.asset_meta()
     if universe is None:
         symbols = resolve_symbols(cfg, metas)
     else:
-        symbols = resolve_universe(cfg, metas, universe)
+        # Written back only when it changed, so the file is a record of the
+        # decisions that were made rather than of how often we reconnected.
+        # An unset target means this is the resolve that chooses one.
+        held = list(universe)
+        symbols = resolve_universe(cfg, metas, universe, universe_target)
+        if universe != held:
+            save_universe(cfg.universe_path, universe,
+                          universe_target or len(universe))
     payouts = {s: metas[s].payout for s in symbols if s in metas}
     log.info("trading %d markets: %s", len(symbols),
              format_universe(symbols, metas) or ", ".join(symbols))
@@ -458,8 +539,18 @@ async def run(cfg: Config) -> None:
     failures = 0
     backoff = BACKOFF_MIN
     # The universe is resolved once and then held: see ``resolve_universe`` for
-    # why re-deriving it per reconnect costs bars.
+    # why re-deriving it per reconnect costs bars. Held *on disk* as well as in
+    # memory, for the same reason one step further out — a restart is the same
+    # decision resumed, and re-deciding it dropped every market whose series was
+    # deep enough to have produced a signal. Explicit ``ASSETS`` names a
+    # universe outright, so there is nothing here to remember.
     universe: list[str] = []
+    universe_target = 0
+    if not cfg.assets:
+        universe, universe_target = load_universe(cfg.universe_path)
+        if universe:
+            log.info("holding %d market(s) from %s: %s",
+                     len(universe), cfg.universe_path, ", ".join(universe))
     healthy_after = healthy_session_seconds(cfg.candle_period)
     # A refused account is a standing condition, not an event: say so once
     # rather than on every reconnect.
@@ -486,7 +577,8 @@ async def run(cfg: Config) -> None:
                                 pass
                 await trading_session(cfg, feed, sender, stats, controller,
                                       status_holder, broker=broker,
-                                      universe=universe)
+                                      universe=universe,
+                                      universe_target=universe_target)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -507,6 +599,11 @@ async def run(cfg: Config) -> None:
                         pass
                 await asyncio.sleep(delay)
             finally:
+                # The size is settled by the first resolve and kept from then
+                # on, so a session that never got as far as resolving cannot
+                # shrink the target by saving a shorter list over it.
+                if universe and not cfg.assets and not universe_target:
+                    universe_target = len(universe)
                 if feed is not None:
                     try:
                         await feed.close()

@@ -14,6 +14,9 @@ bot*.log*
 signals*.jsonl
 stats*.json
 winrate.json
+# The markets this bot holds, so a restart resumes the same ones. Personal:
+# which pairs are worth tracking is a decision, not source.
+universe.json
 
 # Market data. Regenerated at runtime; the 1-minute store is the archived
 # history from before the period changed to 300s.

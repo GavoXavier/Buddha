@@ -12,12 +12,14 @@ here rather than left to the loop.
 """
 
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from config import Config
 from main import (
     BACKOFF_MAX, BACKOFF_MIN, HEALTHY_SESSION_SECONDS, WakeLock, backoff_step,
-    healthy_session_seconds, resolve_universe,
+    healthy_session_seconds, load_universe, resolve_universe, save_universe,
 )
 from market.universe import AssetMeta
 
@@ -182,6 +184,115 @@ class TestUniverseIsSticky(unittest.TestCase):
 
         self.assertEqual(kept, ["EURUSD_otc"], "an empty universe is worse than a new one")
         self.assertEqual(sticky, ["EURUSD_otc"])
+
+
+class TestUniverseSurvivesARestart(unittest.TestCase):
+    """The membership is held on disk, because a restart is not a new decision.
+
+    This is the same argument as the sticky list one level out, and it was
+    measured rather than reasoned: on 2026-09-16 five of the twenty-one stored
+    markets had stopped receiving bars, and they were exactly the markets that
+    had produced a signal — a market signals when its series is deep, and depth
+    is what a re-resolved universe throws away. A restart is a thing this bot
+    does often; four process starts in eighty minutes on 2026-09-15.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = str(Path(self.tmp.name) / "universe.json")
+
+    def test_a_first_run_has_nothing_to_hold(self):
+        self.assertEqual(load_universe(self.path), ([], 0))
+
+    def test_an_unreadable_file_is_re_derived_rather_than_refused(self):
+        # A cache that cannot be read is not a reason to refuse to start: the
+        # bot simply chooses a universe, which is where it would have been
+        # without the file at all.
+        for junk in ("not json at all", "{}", '{"symbols": "EURUSD_otc"}',
+                     "[7, null]"):
+            with self.subTest(junk=junk):
+                Path(self.path).write_text(junk, encoding="utf-8")
+                self.assertEqual(load_universe(self.path), ([], 0))
+
+    def test_the_membership_and_the_size_round_trip(self):
+        save_universe(self.path, ["EURUSD_otc", "GBPUSD_otc"], 16)
+
+        self.assertEqual(load_universe(self.path),
+                         (["EURUSD_otc", "GBPUSD_otc"], 16))
+
+    def test_a_file_with_no_size_holds_what_it_lists(self):
+        # What a hand-written or older file looks like. Reading the size off
+        # the list is the same rule the file would have been written with.
+        Path(self.path).write_text('["EURUSD_otc", "GBPUSD_otc"]',
+                                   encoding="utf-8")
+
+        self.assertEqual(load_universe(self.path),
+                         (["EURUSD_otc", "GBPUSD_otc"], 2))
+
+    def test_junk_beside_a_market_is_dropped_rather_than_the_market(self):
+        # A half-written or hand-edited file should cost the entries that are
+        # not markets, not all of them: the membership is the part that is
+        # expensive to re-earn.
+        Path(self.path).write_text('["EURUSD_otc", 7, null]', encoding="utf-8")
+
+        self.assertEqual(load_universe(self.path), (["EURUSD_otc"], 1))
+
+    def test_a_file_that_cannot_be_written_does_not_end_the_session(self):
+        # The directory does not exist, which is what a mistyped UNIVERSE_PATH
+        # looks like. The universe is a convenience, not a dependency.
+        save_universe(str(Path(self.tmp.name) / "nope" / "universe.json"),
+                      ["EURUSD_otc"], 1)
+
+    def test_a_market_the_feed_lets_go_is_replaced_to_keep_the_size(self):
+        # Otherwise the universe slowly shrinks to whatever the feed still
+        # offers, and a session starves one departure at a time.
+        cfg = Config(min_payout=60)
+        sticky = ["EURUSD_otc", "GBPUSD_otc"]
+        kept = resolve_universe(cfg, {
+            "EURUSD_otc": meta("EURUSD_otc", payout=90),
+            "USDJPY_otc": meta("USDJPY_otc", payout=95),
+        }, sticky, target=2)
+
+        self.assertEqual(kept, ["EURUSD_otc", "USDJPY_otc"])
+        self.assertEqual(sticky, ["EURUSD_otc", "USDJPY_otc"])
+
+    def test_the_replacement_never_outgrows_the_size_it_is_holding(self):
+        cfg = Config(min_payout=60)
+        sticky = ["EURUSD_otc", "GBPUSD_otc", "AUDUSD_otc"]
+        kept = resolve_universe(cfg, {
+            "AUDUSD_otc": meta("AUDUSD_otc", payout=90),
+            "USDJPY_otc": meta("USDJPY_otc", payout=95),
+            "NZDUSD_otc": meta("NZDUSD_otc", payout=95),
+            "USDCAD_otc": meta("USDCAD_otc", payout=95),
+        }, sticky, target=3)
+
+        self.assertEqual(kept[0], "AUDUSD_otc", "what survived keeps its place")
+        self.assertEqual(len(kept), 3)
+
+    def test_a_universe_that_cannot_be_refilled_keeps_what_it_has(self):
+        # Every market the feed offers is under the payout floor while the one
+        # already held is not. Nothing to replace it with is not a failure —
+        # and it must not raise, or a payout dip would end the session.
+        cfg = Config(min_payout=60)
+        sticky = ["EURUSD_otc", "GBPUSD_otc"]
+        kept = resolve_universe(cfg, {
+            "EURUSD_otc": meta("EURUSD_otc", payout=90),
+            "CHEAP_otc": meta("CHEAP_otc", payout=10),
+        }, sticky, target=2)
+
+        self.assertEqual(kept, ["EURUSD_otc"])
+
+    def test_no_target_means_no_refill(self):
+        # The pure behaviour the reconnect tests rely on: without a size to
+        # hold, the universe is only ever pruned.
+        sticky = ["EURUSD_otc", "GBPUSD_otc"]
+        kept = resolve_universe(Config(), {
+            "EURUSD_otc": meta("EURUSD_otc", payout=90),
+            "USDJPY_otc": meta("USDJPY_otc", payout=95),
+        }, sticky)
+
+        self.assertEqual(kept, ["EURUSD_otc"])
 
 
 class TestBackoffStep(unittest.TestCase):

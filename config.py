@@ -120,6 +120,10 @@ class Config:
     # Per-trade record, for reconciling the bot's labels against the broker's.
     signal_journal_path: str = "signals.jsonl"
     journal_signals: bool = True
+    # The markets this bot trades, held across restarts rather than re-derived
+    # from the broker's live payout list on every start. Delete it to choose a
+    # universe afresh — see ``main.resolve_universe`` for what re-choosing costs.
+    universe_path: str = "universe.json"
     log_level: str = "INFO"
 
     signal: SignalConfig = field(default_factory=SignalConfig)
@@ -301,6 +305,7 @@ def load_config() -> Config:
         stats_path=_get("STATS_PATH", "stats.json"),
         legacy_stats_path=_get("LEGACY_STATS_PATH", "winrate.json"),
         signal_journal_path=_get("SIGNAL_JOURNAL_PATH", "signals.jsonl"),
+        universe_path=_get("UNIVERSE_PATH", "universe.json"),
         journal_signals=_bool("JOURNAL_SIGNALS", True),
         log_level=_get("LOG_LEVEL", "INFO").strip().upper(),
         signal=_signal_config(),

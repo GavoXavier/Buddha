@@ -337,6 +337,37 @@ Two honest ways out, and no third one:
 Leaving `USE_TREND=1` with an unreachable `TREND_EMA_LEN` is the one state worth
 avoiding, because it looks like a filter is running when nothing is.
 
+### Which markets it trades, and why that list is remembered
+
+`ASSETS` is empty, so the universe comes from the broker's own asset list:
+active OTC majors paying at least `MIN_PAYOUT`, sorted by payout. That list is
+republished on every connect, and it moves — which is fine for choosing a
+universe once and ruinous for choosing it repeatedly, because of one rule: **bars
+cannot be read across a hole**, and a market that stops receiving ticks for more
+than `MAX_GAP_BARS` (25 minutes at 300s) loses the series it had accumulated.
+
+So the membership is remembered rather than re-derived. In memory for the life of
+a process, and on disk (`universe.json`) across restarts, because a restart is
+the same decision resumed — and the bot restarts often. Measured on 2026-09-16:
+of the 21 markets whose bars were on disk, five had stopped receiving them, and
+they were **exactly the five that had produced a signal** — 14 of the 40 in the
+record, including `EURJPY_otc`, the second most prolific of all ten.
+
+That is not a coincidence and not a random five. A market signals when its series
+is deep enough to warm the indicators, depth comes from unbroken continuity, and
+continuity is precisely what a re-chosen universe throws away. The markets with
+the most to lose were the markets doing the work; and of the sixteen the feed was
+still offering, only two held a run deep enough to warm the veto at all — the
+56 bars it needs, against the 76 they had — so those two were surviving on luck
+rather than on anything the code did.
+
+The rules now are: a market the feed still offers keeps its place regardless of
+what it pays (the payout floor is applied to each *setup* instead, in
+`scheduler._collect`, so a market that cheapens is passed over rather than
+dropped); a market the feed has genuinely stopped offering is let go and one
+replaces it, so the size holds steady; and `ASSETS` still names a universe
+outright, with nothing to remember. Delete `universe.json` to choose afresh.
+
 ---
 
 ## Project layout
@@ -363,7 +394,7 @@ POCKET/
 │   └── ranking.py        # picking one market out of many
 ├── data/                 # base.py, pocket_option.py, simulated.py
 ├── telegram/             # sender.py (formatting), control.py (/commands)
-└── tests/                # 545 tests, ~20 seconds, no network
+└── tests/                # 555 tests, ~20 seconds, no network
 ```
 
 ## Setup
@@ -770,6 +801,7 @@ The ones worth knowing first:
 | `ASSET_MODE` | `major` | `major`, `forex` or `all` |
 | `OTC_ONLY` | `1` | `_otc` assets trade 24/7 |
 | `MIN_PAYOUT` | `60` | skip markets paying less than this % |
+| `UNIVERSE_PATH` | `universe.json` | the markets this bot trades, remembered across restarts — delete it to choose afresh |
 | `CANDLE_PERIOD` | `300` | seconds per bar — sets the whole rhythm |
 | `EXPIRY` | `5m` | trade duration; match it to `CANDLE_PERIOD` |
 | `SIGNAL_LEAD_SECONDS` | `300` | how early the signal is sent; at most one bar |
@@ -781,7 +813,7 @@ The ones worth knowing first:
 | `TREND_FLAT_MIN_SCORE` | `3` | evidence demanded in a flat market |
 | `USE_TREND` | `1` | the trend as a veto; `0` runs without it, and says so |
 | `TREND_EMA_LEN` | `50` | bars the trend EMA needs — with `TREND_SLOPE_BARS` this sets how deep a run must be before the veto exists (56) |
-| `MAX_BARS` | `500` | bars kept per market in memory and on disk — also the ceiling on how much history a backtest can ever replay (~41.7h at 300s bars) |
+| `MAX_BARS` | `500` | bars kept per market in memory and on disk — the ceiling on how much history a backtest can ever replay (~41.7h at 300s bars), and past it the store *discards* the oldest bars rather than growing, so raising it before the cap binds is what keeps the history. It changes no strategy; `calibrate.py` names the size this rate would need |
 | `MAX_GAP_BARS` | `5` | feed outage longer than this drops the bars before it |
 | `PERSIST_CANDLES` | `1` | keep bars on disk for a warm restart |
 | `JOURNAL_SIGNALS` | `1` | write the per-trade record `reconcile.py` reads |
