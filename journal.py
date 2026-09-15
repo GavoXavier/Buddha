@@ -315,21 +315,28 @@ class LoadedJournal:
                 continue
             returns.append(value)
 
+        # Signals that never settled are not "settled trades kept out": they are
+        # the difference between how many signals the bot sent and how many the
+        # record can account for, which a reader of the line should be able to
+        # see rather than infer from a smaller n.
+        unsettled = len(self.trades) - len(self.settled)
+
         n = len(returns)
         if not n:
-            return ExpectedValue(unpriced=unpriced, unjudged=unjudged)
+            return ExpectedValue(unpriced=unpriced, unjudged=unjudged,
+                                 unsettled=unsettled)
         mean = sum(returns) / n
         if n < 2:
             # One trade has no spread to estimate, so there is no interval to
             # print — only the number itself.
             return ExpectedValue(n=n, mean=mean, unpriced=unpriced,
-                                 unjudged=unjudged)
+                                 unjudged=unjudged, unsettled=unsettled)
         variance = sum((r - mean) ** 2 for r in returns) / (n - 1)
         stdev = math.sqrt(variance)
         half = Z_95 * stdev / math.sqrt(n)
         return ExpectedValue(n=n, mean=mean, stdev=stdev, low=mean - half,
                              high=mean + half, unpriced=unpriced,
-                             unjudged=unjudged)
+                             unjudged=unjudged, unsettled=unsettled)
 
     def between(self, start: float, end: float) -> "LoadedJournal":
         """Only the signals entered in ``[start, end]`` — the reconcile window."""
@@ -364,6 +371,12 @@ class ExpectedValue:
     # refund (the broker's answer could not be read).
     unpriced: int = 0
     unjudged: int = 0
+    # Signals with no outcome at all, ever: the trade was sent and never settled.
+    # Kept out of the average like the rest, but counted separately, because they
+    # say something different — not "how it ended is unreadable" but "how it ended
+    # is not known", which is also why n is smaller than the number of signals the
+    # bot has sent.
+    unsettled: int = 0
 
     @property
     def excluded(self) -> int:
@@ -435,6 +448,8 @@ def _exclusions(ev: ExpectedValue) -> str:
         parts.append(f"{ev.unpriced} win(s) unpriced")
     if ev.unjudged:
         parts.append(f"{ev.unjudged} unreadable")
+    if ev.unsettled:
+        parts.append(f"{ev.unsettled} never settled")
     return ", ".join(parts)
 
 

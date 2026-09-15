@@ -441,6 +441,40 @@ class TestWhatTheRecordIsWorth(unittest.TestCase):
 
         self.assertEqual(ev.n, 0)
         self.assertEqual(ev.excluded, 0, "never settled is not the same as dropped")
+        self.assertEqual(ev.unsettled, 1)
+
+    def test_a_signal_that_never_settled_is_named_in_the_line(self):
+        # The line's n is smaller than the number of signals the bot sent, and a
+        # reader has no way to tell an empty week from four orphans unless the
+        # line says which. It is the same reason the other exclusions are named.
+        loaded = LoadedJournal(trades=[self.trade("WIN", payout=92),
+                                       self.trade("LOSS", payout=92),
+                                       self.trade(None, payout=92),
+                                       self.trade(None, payout=92)])
+
+        ev = loaded.expected_value()
+
+        self.assertEqual(ev.n, 2, "the two with outcomes still set the average")
+        self.assertEqual(ev.unsettled, 2)
+        self.assertIn("2 never settled", format_ev(ev))
+        self.assertIn("n=2", format_ev(ev))
+
+    def test_unsettled_signals_alone_still_say_why_there_is_no_number(self):
+        loaded = LoadedJournal(trades=[self.trade(None, payout=92)])
+
+        self.assertEqual(format_ev(loaded.expected_value()),
+                         "EV unknown | 1 never settled")
+
+    def test_the_never_settled_count_is_the_gap_between_sent_and_settled(self):
+        # Defined as the difference, not as a separate tally, so the line cannot
+        # disagree with the journal it was read from.
+        loaded = LoadedJournal(trades=[self.trade("WIN", payout=92),
+                                       self.trade("LOSS", payout=92),
+                                       self.trade(None, payout=92)])
+
+        ev = loaded.expected_value()
+
+        self.assertEqual(ev.unsettled + len(loaded.settled), len(loaded))
 
     def test_a_majority_of_wins_can_still_be_a_losing_record(self):
         # The whole reason this exists: 52% reads like a winning record and is
