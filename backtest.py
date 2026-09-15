@@ -57,6 +57,7 @@ import argparse
 import json
 import sys
 from bisect import bisect_right
+from dataclasses import replace
 from pathlib import Path
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -66,7 +67,8 @@ from config import Config, ConfigError, load_config
 from engine.scheduler import outcome_of
 from market.aggregator import contiguous_runs
 from market.store import CandleStore
-from signals.engine import Candle, _analyze, evaluate, vote_components
+from signals.engine import (Candle, SignalConfig, _analyze, evaluate,
+                            vote_components)
 from signals.ranking import Candidate, select_best
 from telegram.sender import configure_clock
 
@@ -80,7 +82,8 @@ _GATED = "rejected by a gate (trend / MTF / ATR / S-R)"
 class Store:
     """The persisted candle store, indexed for replay."""
 
-    def __init__(self, directory: str | Path, cfg: Config, hours: float = 0.0):
+    def __init__(self, directory: str | Path, cfg: Config, hours: float = 0.0,
+                 window: tuple[float, float] | None = None):
         self.cfg = cfg
         # Match the feed this config would connect to, so replaying a simulated
         # store is not silently presented as a measurement of the live market.
@@ -97,6 +100,11 @@ class Store:
             if hours > 0 and candles:
                 cutoff = candles[-1].time - hours * 3600
                 candles = [c for c in candles if c.time >= cutoff]
+            if window is not None:
+                # Half-open, and applied per market, so a sweep can hold back a
+                # later slice of *every* market's history rather than of the
+                # universe as a whole.
+                candles = [c for c in candles if window[0] <= c.time < window[1]]
             if len(candles) < 2:
                 continue
             runs = contiguous_runs(candles, cfg.candle_period, cfg.max_gap_bars)
@@ -178,6 +186,19 @@ class Store:
             return []
         return candles[start:i]
 
+    def span_hours(self) -> float:
+        """Wall-clock hours from the store's first bar to its last.
+
+        First and last *across markets*, not summed per market: a market tracked
+        for an hour inside a six-hour session is an hour of sample on that market
+        and six hours of elapsed time, and it is the elapsed time that says how
+        much the replay has to work with.
+        """
+        marks = [t for bars in self.bars.values() for t in (bars[0].time, bars[-1].time)]
+        if len(marks) < 2:
+            return 0.0
+        return max(0.0, (max(marks) - min(marks)) / 3600.0)
+
     def deepest_run(self) -> int:
         """Bars in the longest contiguous run any market offers.
 
@@ -219,9 +240,14 @@ class Store:
 class Replay:
     """One pass of the whole universe, exactly one signal per boundary at most."""
 
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, signal: SignalConfig | None = None):
         self.store = store
-        self.cfg = store.cfg
+        # Only the selectivity dials may be swapped out, and only through this
+        # argument. The structural settings — period, lead, cooldown, max_bars —
+        # decide which bars a window holds and when a signal fires, and a Store
+        # indexed its runs against them, so a Replay that disagreed with its Store
+        # about those would be reading an index built for another config.
+        self.cfg = replace(store.cfg, signal=signal) if signal else store.cfg
         self.last_signal_at: dict[str, float] = {}
         self.trades: list[dict] = []
         self.reasons: dict[str, int] = {}
@@ -339,10 +365,7 @@ class Replay:
         return len(self.trades) - self.wins
 
     def hours(self) -> float:
-        marks = [t for b in self.store.bars.values() for t in (b[0].time, b[-1].time)]
-        if len(marks) < 2:
-            return 0.0
-        return max(0.0, (max(marks) - min(marks)) / 3600.0)
+        return self.store.span_hours()
 
     def report(self) -> None:
         cfg = self.cfg

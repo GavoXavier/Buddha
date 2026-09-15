@@ -150,6 +150,39 @@ correlated**, when the dollar goes quiet every pair reads flat at once. A hard
 flat veto starves the bot; a strength requirement keeps it in the market for the
 setups that are clear even without a trend.
 
+### Choosing them with `calibrate.py`, which mostly refuses to
+
+```bash
+python calibrate.py                  # sweep the dials, on bars held back from it
+python calibrate.py --min-hours 0    # sweep a store too short to mean anything
+python calibrate.py --payout 92      # compare against a different break-even
+```
+
+Every market's history is cut by time into a **training** window and a window
+**held back** from the sweep, and the table prints both columns side by side. The
+train column is what a search would have picked; the held-out column is what
+happened next. Where they disagree, the train column was noise — which on a short
+store is most of the time, and seeing that is the point.
+
+One dial is varied at a time from the shipped settings, never a cross product.
+The question worth asking first is what each dial *buys*, and a grid over six
+dials is unreadable with a best row that is a coincidence.
+
+**It refuses to sweep a store shorter than `--min-hours` (48 by default)**, and
+prints how much longer to wait instead of a table. That is not timidity: the
+trend veto alone needs 4h40m of one unbroken run, so on a five-hour store the
+columns would be measuring warm-up rather than dials.
+
+Two things it cannot do, both stated in its own output:
+
+- **The store records prices, not payouts.** A single assumed payout (`--payout`,
+  85% by default) converts accuracy into a break-even accuracy. 54% is a losing
+  record at 85% and a winning one at 92%, so the assumption is printed rather than
+  buried.
+- **It does not choose.** No row is called best, and a row whose *lower* bound
+  clears break-even is named without being endorsed — "re-run after more uptime
+  before changing a dial on it, because a sweep read once is a sweep read wrong".
+
 ---
 
 ## Why candles are built from ticks, never from history
@@ -275,6 +308,7 @@ POCKET/
 ├── main.py               # wiring: feed → market → scheduler, reconnect supervisor
 ├── config.py             # .env → Config, with fail-fast validation
 ├── backtest.py           # replay the candle store through the live signal path
+├── calibrate.py          # sweep the dials, on bars held back from the sweep
 ├── reconcile.py          # check our WIN/LOSS labels against the broker's
 ├── journal.py            # per-trade record of every signal sent
 ├── execution.py          # demo-only order placement, so the broker settles it
@@ -291,7 +325,7 @@ POCKET/
 │   └── ranking.py        # picking one market out of many
 ├── data/                 # base.py, pocket_option.py, simulated.py
 ├── telegram/             # sender.py (formatting), control.py (/commands)
-└── tests/                # 287 tests, ~14 seconds, no network
+└── tests/                # 499 tests, ~16 seconds, no network
 ```
 
 ## Setup
