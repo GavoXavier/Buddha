@@ -1,0 +1,7 @@
+# Runtime
+pocket-option          # unofficial SDK: ticks, asset list, payouts
+aiohttp                # async HTTP for the Telegram bot API
+python-dotenv          # .env → environment
+
+# Development (not needed to run the bot)
+pytest                 # `python -m pytest -q` — see README

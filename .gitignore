@@ -1,0 +1,27 @@
+# Credentials. One file, four live secrets: Telegram bot token, chat id,
+# Pocket Option SSID and uid. If this is ever committed the secrets are in the
+# history for good, so it is listed first and it is the reason this file exists.
+.env
+
+# Local Claude Code settings
+.claude/
+
+# Runtime state and trading records — personal, not source
+bot.log*
+*.contaminated-*
+signals*.jsonl
+stats*.json
+winrate.json
+
+# Market data. Regenerated at runtime; the 1-minute store is the archived
+# history from before the period changed to 300s.
+candles/
+candles-1m-2026-09-15/
+
+# Bytecode and test caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Scratch copies
+*.bak
