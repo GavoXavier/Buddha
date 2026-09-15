@@ -274,6 +274,17 @@ engine sees is aggregated here from ticks this process actually received:
   second time to the archive (`CANDLE_ARCHIVE_DIR`), which holds far more of them
   and is read only by `backtest.py` and `calibrate.py` — see the sample section
   above for why the two caps are different questions.
+- **One feed per store directory**, and that is enforced on writing as well as
+  reading. Each file is stamped with the feed that wrote it; a store carrying
+  another feed's stamp is never read from — and never written over, because the
+  merge on the way out reads the disk through the same check, sees nothing, and
+  writes the caller's series on its own. Without that second half, starting a
+  `FEED=simulated` session in the live store's directory replaces every file with
+  a fabricated series: measured on 2026-09-16, a 50-bar live store became a 3-bar
+  simulated one and none of the 50 could be read back. Watched bars are the one
+  input the broker will not re-supply, so the write is refused with an error
+  naming both feeds. Give each feed its own `CANDLE_STORE_DIR`, or delete the file
+  to start that feed's series from scratch.
 - A hole longer than `MAX_GAP_BARS` bars **drops the bars before it** and the
   market warms up again. The indicators assume evenly spaced bars, so a window
   spanning a hole reads the whole outage as a single bar's move: after a
