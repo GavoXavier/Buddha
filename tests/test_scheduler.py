@@ -715,6 +715,18 @@ class TestThePayoutFloorIsEnforcedAtTheSignal(unittest.TestCase):
     def play(self, closes, start=None):
         return asyncio.run(self.h.play(closes, start))
 
+    def test_a_market_paying_exactly_the_floor_is_traded(self):
+        # The floor is "at least", not "more than" — a live NZDUSD signal went
+        # out at exactly 60% against MIN_PAYOUT=60. Pinned because the two
+        # differ by one character and the wrong one would quietly drop every
+        # market sitting on the floor.
+        h = Harness(symbols=("EDGE_otc",), payouts={"EDGE_otc": 60}, min_payout=60)
+        self.addCleanup(h.cleanup)
+
+        asyncio.run(h.play([99.0, 100.0, 101.0]))
+
+        self.assertEqual([s["asset"] for s in h.sender.signals], ["EDGE_otc"])
+
     def test_the_market_under_the_floor_is_not_signalled(self):
         results = self.play([99.0, 100.0, 101.0])
 
