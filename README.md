@@ -301,11 +301,15 @@ components degrade gracefully while they fill in: the bot signals as soon as
 `MIN_COMPONENTS` directional indicators are warm, and messages you "warming up:
 12/56 bars" rather than staying silently broken. The trend is the exception, and
 it is a large one — see [below](#the-one-component-that-vetoes-is-the-one-that-can-be-missing).
-Raise `MAX_BARS` to hold more history; restart warm-up is free once the store has
-data. Because the store keeps only the newest `MAX_BARS` per market, `MAX_BARS` is
-also the one dial that changes how much *sample* a backtest can ever see — 500 bars
-of 5-minute candles is ~41.7 hours, and past that the window slides rather than
-grows.
+Raise `MAX_BARS` to hold more history. Restart warm-up is free *only while the
+downtime is short*: a hole longer than `MAX_GAP_BARS` bars trims the restored
+series exactly as it trims a live one, so an outage past 25 minutes (5 × 300s)
+costs every market its run — and with it up to 4h40m of trend veto on each.
+Measured on 2026-09-16, a two-hour outage left 9 of 16 markets restored to
+between 3 and 34 bars. Because the store keeps only the newest `MAX_BARS` per
+market, `MAX_BARS` also bounds how much *sample* a backtest can ever see — 500
+bars of 5-minute candles is ~41.7 hours, and past that the window slides rather
+than grows. That bound is why the bars are kept a second time at `ARCHIVE_BARS`.
 
 **Warm-up is counted in bars, so it scales with the bar length.** On 5-minute
 bars the first possible signal is 18 bars ≈ **90 minutes** after a cold start, and
@@ -515,7 +519,7 @@ the code:
 |---|---|
 | **Lid close** | a user-initiated transition, not an idle one. Set "when I close the lid" to *Do nothing*. |
 | **Battery** | the low-battery hibernate is unconditional. Keep it plugged in. |
-| **Reboot or crash** | nothing restarts it. A Scheduled Task with the default 3-day execution limit disabled will. |
+| **Reboot or crash** | nothing restarts it. A Scheduled Task with the default 3-day execution limit disabled will. Downtime past 25 minutes also costs every market its unbroken run, so a restart is cheap and a long stop is not. |
 
 ### Telegram commands
 
