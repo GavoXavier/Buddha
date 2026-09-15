@@ -350,9 +350,24 @@ class MinuteScheduler:
         a tick happened to land before the cycle ran, so the distortion would
         come and go. At a full-bar lead the decision window is simply the bars
         that have already closed.
+
+        The payout floor is applied here, to the setup rather than to the
+        market. It was only ever applied when the universe was chosen, and the
+        universe is sticky by design, so a market picked at 92% could fall to
+        anything and still be traded: on 2026-09-15 a CADJPY signal went out at
+        38%, which needs 72% accuracy to break even, and lost. Dropping such a
+        market from the universe would be the wrong repair — that churn is what
+        truncated the stored series in the first place — so it keeps its bars
+        and its place, and is passed over for as long as it pays too little.
+
+        A payout of zero means *not known*, not *worthless*: the map is rebuilt
+        per session from whatever the feed last published, and an empty one must
+        not silence every market at once. Those keep the benefit of the doubt
+        they were already given at selection time.
         """
         closed_only = self.cadence.lead_seconds >= self.cadence.period
         candidates: list[Candidate] = []
+        underpriced: list[tuple[str, int]] = []
         for symbol in healthy:
             series = self.market.track(symbol)
             if closed_only:
@@ -364,9 +379,19 @@ class MinuteScheduler:
             signal = evaluate(buffer, self.engine_config)
             if signal is None:
                 continue
+            payout = self.payouts.get(symbol, 0)
+            if 0 < payout < self.min_payout:
+                # Only a setup that would otherwise have been traded is worth
+                # naming: this line is about a trade not taken, so a market with
+                # nothing to say is not in it.
+                underpriced.append((symbol, payout))
+                continue
             candidates.append(Candidate(
-                asset=symbol, signal=signal,
-                payout=self.payouts.get(symbol, 0), bars=len(buffer)))
+                asset=symbol, signal=signal, payout=payout, bars=len(buffer)))
+        if underpriced:
+            log.info("%d setup(s) passed over for paying under %d%%: %s",
+                     len(underpriced), self.min_payout,
+                     ", ".join(f"{s} {p}%" for s, p in underpriced))
         return candidates
 
     async def _send_signal(self, winner: Candidate, boundary: int,

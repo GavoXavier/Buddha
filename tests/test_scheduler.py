@@ -13,6 +13,7 @@ The timing model under test (period 60s, lead 10s):
 """
 
 import asyncio
+import logging
 import tempfile
 import unittest
 import unittest.mock
@@ -51,7 +52,7 @@ class FakeSender:
                           payout=0, martingale_steps=0, entry_price=None):
         self.signals.append({"asset": asset, "direction": signal.direction,
                              "expiry": expiry, "entry_at": entry_at,
-                             "price": entry_price})
+                             "price": entry_price, "payout": payout})
         return {"ok": True}
 
     async def send_confirmation(self, asset, direction, outcome, wins, losses,
@@ -76,7 +77,7 @@ class Harness:
     """
 
     def __init__(self, direction="CALL", cadence=None, symbols=("AAA_otc",),
-                 config=None):
+                 config=None, payouts=None, min_payout=0):
         self.cadence = cadence or Cadence()
         self.period = self.cadence.period
         self.vc = VirtualClock(start=BASE)
@@ -93,7 +94,8 @@ class Harness:
             market=self.market, sender=self.sender, stats=self.stats,
             controller=self.controller, cadence=self.cadence,
             engine_config=config or SignalConfig(), symbols=self.symbols,
-            payouts={s: 85 for s in self.symbols}, clock=self.vc)
+            payouts={s: 85 for s in self.symbols} if payouts is None else payouts,
+            min_payout=min_payout, clock=self.vc)
 
     def feed(self, end, close, high=None, low=None):
         """Replay the bar that *ends* at ``end`` (opens ``end - period``).
@@ -682,6 +684,118 @@ class TestJournalRecovery(SchedulerCase):
     def test_without_a_journal_there_is_nothing_to_recover(self):
         self.h.scheduler.journal = None
         self.assertEqual(self.h.scheduler.recover_from_journal(), [])
+
+
+class TestThePayoutFloorIsEnforcedAtTheSignal(unittest.TestCase):
+    """A market paying too little is passed over, not thrown out.
+
+    The floor was applied once, when the universe was chosen, and the universe
+    is sticky by design — so a market picked at 92% could fall to anything and
+    still be traded. Observed on 2026-09-15: a CADJPY signal at 38%, which
+    needs 72% accuracy to break even, and lost.
+
+    Dropping the market from the universe instead would have been the wrong
+    repair: that churn is what truncated the stored series and left signals
+    with no bars to settle against. It keeps its place and its bars, and only
+    the trade is withheld.
+    """
+
+    RICH, POOR = "RICH_otc", "POOR_otc"
+
+    def setUp(self):
+        self.h = Harness(symbols=(self.RICH, self.POOR),
+                         payouts={self.RICH: 92, self.POOR: 38},
+                         min_payout=60)
+        self.addCleanup(self.h.cleanup)
+        patch = unittest.mock.patch.object(sched_mod, "evaluate",
+                                           fake_evaluate("CALL"))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def play(self, closes, start=None):
+        return asyncio.run(self.h.play(closes, start))
+
+    def test_the_market_under_the_floor_is_not_signalled(self):
+        results = self.play([99.0, 100.0, 101.0])
+
+        self.assertTrue(any(r.chosen for r in results), "the rich market should fire")
+        self.assertEqual([s["asset"] for s in self.h.sender.signals], [self.RICH])
+        self.assertEqual([t.asset for t in self.h.scheduler.open_trades], [self.RICH])
+
+    def test_the_signal_carries_the_payout_it_was_judged_on(self):
+        self.play([99.0, 100.0, 101.0])
+
+        self.assertEqual(self.h.sender.signals[0]["payout"], 92)
+
+    def test_the_passed_over_market_keeps_its_bars(self):
+        self.play([99.0, 100.0, 101.0])
+
+        poor = self.h.market.track(self.POOR).bar_count
+        self.assertGreater(poor, 0, "it is still subscribed and still ticking")
+        self.assertEqual(poor, self.h.market.track(self.RICH).bar_count,
+                         "tracked exactly like a market it would trade")
+
+    def test_the_setup_that_was_passed_over_is_named(self):
+        with self.assertLogs("pocket.scheduler", level="INFO") as caught:
+            self.play([99.0, 100.0, 101.0])
+
+        self.assertTrue(
+            any(f"{self.POOR} 38%" in line and "under 60%" in line
+                for line in caught.output),
+            f"the reason for the silence should be in the log: {caught.output}")
+
+    def test_a_market_with_nothing_to_say_is_not_named(self):
+        # The line is about a trade not taken, so it must not list every cheap
+        # market on every bar — only the ones that had a setup to take.
+        self.h.scheduler.payouts[self.POOR] = 10
+        self.h.feed(int(BASE), 100.0)              # one bar: no setup on either
+        said: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: said.append(record.getMessage())
+        logger = logging.getLogger("pocket.scheduler")
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+
+        candidates = self.h.scheduler._collect([self.POOR], int(BASE))
+
+        self.assertEqual(candidates, [], "one bar is not a setup")
+        self.assertEqual([line for line in said if self.POOR in line], [],
+                         "nothing was passed over, so nothing is reported")
+
+    def test_an_unknown_payout_is_not_read_as_a_low_one(self):
+        # The map is rebuilt per session from what the feed last published; an
+        # empty one must not silence every market at once.
+        h = Harness(symbols=(self.RICH,), payouts={}, min_payout=60)
+        self.addCleanup(h.cleanup)
+
+        asyncio.run(h.play([99.0, 100.0, 101.0]))
+
+        self.assertEqual([s["asset"] for s in h.sender.signals], [self.RICH],
+                         "a payout of 0 means unknown, not worthless")
+
+    def test_a_floor_of_zero_disables_the_check(self):
+        h = Harness(symbols=(self.POOR,), payouts={self.POOR: 5}, min_payout=0)
+        self.addCleanup(h.cleanup)
+
+        asyncio.run(h.play([99.0, 100.0, 101.0]))
+
+        self.assertEqual([s["asset"] for s in h.sender.signals], [self.POOR])
+
+    def test_a_market_alone_under_the_floor_sends_nothing_at_all(self):
+        # The decisive case, and the one a two-market test cannot prove: with
+        # only the cheap market there is no winner to fall back on, so a signal
+        # here would mean the floor is not being applied to the setup at all.
+        h = Harness(symbols=(self.POOR,), payouts={self.POOR: 38}, min_payout=60)
+        self.addCleanup(h.cleanup)
+
+        with self.assertLogs("pocket.scheduler", level="INFO") as caught:
+            asyncio.run(h.play([99.0, 100.0, 101.0]))
+
+        self.assertTrue(any(f"{self.POOR} 38%" in line for line in caught.output),
+                        f"the setup existed — the fake engine signals on any "
+                        f"bars — and was passed over: {caught.output}")
+        self.assertEqual(h.sender.signals, [], "and was still not traded")
+        self.assertEqual(h.scheduler.open_trades, [])
 
 
 if __name__ == "__main__":
