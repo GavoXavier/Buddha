@@ -20,7 +20,9 @@ import unittest.mock
 from pathlib import Path
 
 import engine.scheduler as sched_mod
-from engine.scheduler import Cadence, MinuteScheduler, next_boundary, outcome_of
+from engine.scheduler import (
+    Cadence, MinuteScheduler, OpenTrade, next_boundary, outcome_of,
+)
 from journal import SignalJournal, load_journal
 from market.aggregator import MarketState
 from market.clock import VirtualClock
@@ -813,6 +815,105 @@ class TestThePayoutFloorIsEnforcedAtTheSignal(unittest.TestCase):
                         f"bars — and was passed over: {caught.output}")
         self.assertEqual(h.sender.signals, [], "and was still not traded")
         self.assertEqual(h.scheduler.open_trades, [])
+
+
+class TestATradeWithNoBarsIsAbandonedNotInvented(SchedulerCase):
+    """The fallback to the latest tick is bounded, because it can lie.
+
+    Measured live on 2026-09-15: EURNZD_otc entered at 21:05 was adopted at
+    23:42 from the restored bars, those bars were dropped two seconds later when
+    the live feed resumed through a 135-minute gap, and at 23:45 the trade
+    "settled" against the 23:44 price — a loss nobody measured, in the stats and
+    in the journal, and one that moved the expected value by 2.5 points.
+    """
+
+    ASSET = "AAA_otc"
+
+    def journal_for(self, entry_at, expiry_at):
+        journal = SignalJournal(Path(self.h.tmpdir) / "signals.jsonl")
+        journal.record_signal(asset=self.ASSET, direction="CALL",
+                              entry_at=entry_at, expiry_at=expiry_at, payout=85)
+        self.h.scheduler.journal = journal
+        return journal
+
+    def open_a_trade(self, entry_at, expiry_at, entry_price=100.0):
+        trade = OpenTrade(asset=self.ASSET, direction="CALL", entry_at=entry_at,
+                          expiry_at=expiry_at, entry_price=entry_price,
+                          recovered=True)
+        self.h.scheduler.open_trades.append(trade)
+        return trade
+
+    def test_a_bar_that_is_a_little_late_is_still_settled(self):
+        # One bar late: the latest tick is a late reading of the expiry, which
+        # is the case the fallback exists for.
+        self.h.feed(BASE, 100.0)
+        self.h.feed(BASE + 120, 101.0)     # the expiry bucket never landed
+        self.open_a_trade(entry_at=BASE, expiry_at=BASE + 60)
+        self.h.vc._now = BASE + 120
+
+        results = asyncio.run(self.h.scheduler.run_cycle(BASE + 120))
+
+        self.assertEqual(len(results.resolved), 1)
+        self.assertEqual(results.resolved[0].exit_price, 101.0)
+        self.assertEqual(self.h.stats.wins, 1)
+
+    def test_a_trade_whose_bars_are_hours_gone_is_left_unsettled(self):
+        journal = self.journal_for(BASE, BASE + 60)
+        self.h.feed(BASE, 100.0)
+        self.h.feed(BASE + 120, 99.0)
+        self.open_a_trade(entry_at=BASE, expiry_at=BASE + 60)
+        self.h.vc._now = BASE + 60 * 4    # three bars past the expiry
+
+        results = asyncio.run(self.h.scheduler.run_cycle(BASE + 60 * 4))
+
+        self.assertEqual(results.resolved, [], "nothing was settled")
+        self.assertEqual(self.h.stats.total, 0, "and nothing reached the record")
+        self.assertEqual(self.h.stats.consecutive_losses(), 0,
+                         "no invented loss, so no streak toward the breaker")
+        self.assertEqual(self.h.scheduler.open_trades, [], "not retried forever")
+        loaded = load_journal(journal.path)
+        self.assertEqual(loaded.settled, [])
+        self.assertEqual(len(loaded.unsettled), 1, "still visible as unsettled")
+
+    def test_the_abandoned_trade_is_named_in_the_log(self):
+        self.h.feed(BASE, 100.0)
+        self.h.feed(BASE + 120, 99.0)
+        self.open_a_trade(entry_at=BASE, expiry_at=BASE + 60)
+        self.h.vc._now = BASE + 60 * 4
+
+        with self.assertLogs("pocket.scheduler", level="WARNING") as caught:
+            asyncio.run(self.h.scheduler.run_cycle(BASE + 60 * 4))
+
+        self.assertTrue(any("left unsettled rather than settled against a price "
+                            "from after the expiry" in line
+                            for line in caught.output), caught.output)
+
+    def test_an_entry_bar_that_is_gone_does_not_become_a_tie(self):
+        # Pricing the trade off the exit bar alone would make entry == exit,
+        # and a tie settles as a loss. Silence is the honest answer.
+        journal = self.journal_for(BASE + 60, BASE + 120)
+        self.h.feed(BASE + 120, 101.0)     # only the exit bucket exists
+        self.open_a_trade(entry_at=BASE + 60, expiry_at=BASE + 120,
+                          entry_price=None)
+        self.h.vc._now = BASE + 60 * 5
+
+        results = asyncio.run(self.h.scheduler.run_cycle(BASE + 60 * 5))
+
+        self.assertEqual(results.resolved, [])
+        self.assertEqual(self.h.stats.total, 0)
+        self.assertEqual(load_journal(journal.path).settled, [])
+
+    def test_a_fresh_trade_is_never_abandoned(self):
+        # The window must not swallow the ordinary case: the exit bar arrives
+        # while the trade is still young.
+        self.h.feed(BASE, 100.0)
+        self.open_a_trade(entry_at=BASE, expiry_at=BASE + 60)
+        self.h.vc._now = BASE + 30
+
+        asyncio.run(self.h.scheduler.run_cycle(BASE + 60))
+
+        self.assertEqual(len(self.h.scheduler.open_trades), 1,
+                         "still open, waiting for its exit bar")
 
 
 class TestTheStatusLineStatesWhatTheRecordIsWorth(SchedulerCase):

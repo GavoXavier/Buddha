@@ -60,6 +60,11 @@ log = logging.getLogger("pocket.scheduler")
 # How often to repeat the warm-up progress note while waiting for indicators.
 _PROGRESS_EVERY = 600.0
 
+# How many bars late the latest tick may be and still stand in for a missing
+# exit bar. Beyond this the price is not a late reading of the expiry, it is a
+# reading of some other time, and settling at it would be inventing a result.
+FALLBACK_WINDOW_BARS = 2
+
 
 def next_boundary(now: float, period: int) -> int:
     """The first bar boundary strictly after ``now`` (epoch seconds)."""
@@ -502,6 +507,37 @@ class MinuteScheduler:
         log.warning("no broker settlement for %s %s — reporting the bar label",
                     trade.asset, _stamp(trade.entry_at))
 
+    def _abandon(self, trade: OpenTrade, now: float) -> None:
+        """Give up on a trade whose bars the feed never produced.
+
+        Falling back to ``last_price`` is right for an exit bar that is a few
+        minutes late and wrong for one that is hours late: by then "the latest
+        tick" is a price from long after the expiry, and the outcome it yields is
+        invented — indistinguishable, in the record, from a measured one.
+
+        Measured live on 2026-09-15: a trade entered at 21:05 in a market that
+        had dropped out of the universe was adopted at 23:42 from the restored
+        bars, those bars were discarded two seconds later as the live feed
+        resumed (a 135-minute gap), and at 23:45 it "settled" against the 23:44
+        price and was counted as a loss.
+
+        Leaving it unsettled is what ``recover_from_journal`` already does for
+        the trades it cannot price, and the journal has a name for the state:
+        a signal with no result line.
+        """
+        self.open_trades.remove(trade)
+        note = ""
+        if self.broker is not None:
+            # The account's own answer does not need a bar, so if one was
+            # placed it is a real outcome that this path is about to lose.
+            settlement = self.broker.settlement_for(trade.asset, trade.entry_at)
+            note = (f" — the broker settled it {settlement.outcome}, NOT recorded"
+                    if settlement is not None else "")
+        log.warning("%s %s entered %s expired %.0f min ago and its bars are gone "
+                    "— left unsettled rather than settled against a price from "
+                    "after the expiry%s", trade.asset, trade.direction,
+                    _stamp(trade.entry_at), (now - trade.expiry_at) / 60.0, note)
+
     def _broker_note(self, trade: OpenTrade, label: str) -> str:
         """How the broker's settlement sat against our own label, for the log."""
         if trade.broker_outcome is None:
@@ -528,15 +564,27 @@ class MinuteScheduler:
             if exit_price is None:
                 # An expiry that is not a whole number of bars, or a stalled
                 # feed. Give the feed one more bar to produce the exit bar, then
-                # fall back to the latest tick rather than hanging forever.
+                # fall back to the latest tick rather than hanging forever — but
+                # only while "the latest tick" is still a price near the expiry.
                 if now < trade.expiry_at + self.cadence.period:
+                    continue
+                if now - trade.expiry_at > FALLBACK_WINDOW_BARS * self.cadence.period:
+                    self._abandon(trade, now)
                     continue
                 exit_price = series.last_price
                 if exit_price <= 0:
                     continue
             entry_price = trade.entry_price
             if entry_price is None:
-                entry_price = series.price_at_boundary(trade.entry_at) or exit_price
+                # The entry bar can go missing the same way, and pricing the
+                # trade off an exit-only series would make it a tie, which
+                # settles as a loss. Say so instead of inventing one.
+                priced = series.price_at_boundary(trade.entry_at)
+                if priced is None and now - trade.expiry_at > \
+                        FALLBACK_WINDOW_BARS * self.cadence.period:
+                    self._abandon(trade, now)
+                    continue
+                entry_price = priced or exit_price
 
             # Our own label, from the tick bars. Always computed and always
             # journalled — it is the claim the broker's settlement is checked
