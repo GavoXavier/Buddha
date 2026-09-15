@@ -15,14 +15,19 @@ Writes are *additive*: a save unions the series it is given with the one already
 persisted, so a bar that has been watched is never lost to a later, shorter
 series. See ``save`` for why that is not merely tidy.
 
-That last one matters more than it looks. The period check stops 1-minute bars
-being read as 5-minute ones; the feed check stops *fabricated* bars being read as
-real ones. ``FEED=simulated`` writes to the same directory with the same symbols,
-so switching to ``FEED=pocket_option`` without it would quietly seed the live
-indicators with a synthetic price path — and the resulting signals would look
-exactly like real ones. A store whose origin cannot be established (no ``feed``
-field, i.e. written before this check existed) is discarded too: "unknown" is not
-"trusted".
+That last one matters more than it looks, and it is applied to writing as well as
+reading. The period check stops 1-minute bars being read as 5-minute ones; the
+feed check stops *fabricated* bars being read as real ones. ``FEED=simulated``
+writes to the same directory with the same symbols, so switching to
+``FEED=pocket_option`` without it would quietly seed the live indicators with a
+synthetic price path — and the resulting signals would look exactly like real
+ones. A store whose origin cannot be established (no ``feed`` field, i.e. written
+before this check existed) is discarded too: "unknown" is not "trusted".
+
+The same rule governs ``save``: a file this store would not read from is a file it
+will not write over. Reading a fabricated series costs a bad signal; overwriting a
+real one costs the history, which is the only input here the broker cannot
+re-supply — so a refused write is much the cheaper failure. See ``_foreign_feed``.
 """
 
 from __future__ import annotations
@@ -106,6 +111,28 @@ class CandleStore:
                 out[symbol] = candles
         return out
 
+    def _foreign_feed(self, symbol: str) -> Optional[str]:
+        """The feed stamped on the persisted file when it is not ours, else ``None``.
+
+        A file that is missing, unreadable or not a store document has no history
+        to protect, so it is not foreign — the caller may write over it. A file
+        carrying another feed's name is, and the one rule is the one ``load``
+        already applies: **a file this store would not read from it will not write
+        over either.**
+        """
+        path = self._path(symbol)
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            return None
+        if not isinstance(doc, dict):
+            return None
+        stored = str(doc.get("feed", ""))
+        return stored if stored != self.feed else None
+
     def _merge_with_disk(self, symbol: str, candles: Sequence[Candle]) -> list[Candle]:
         """``candles`` unioned with the persisted series, by timestamp.
 
@@ -145,6 +172,26 @@ class CandleStore:
         if not force and now - self._last_save.get(symbol, 0.0) < self.save_interval:
             return
         self._last_save[symbol] = now
+        foreign = self._foreign_feed(symbol)
+        if foreign is not None:
+            # The check in ``load`` is why this bot will not *read* fabricated
+            # bars as history. This one is why it will not destroy real history
+            # with them: without it, running a simulated session in the live
+            # store's directory replaces every file with a fabricated series —
+            # measured on 2026-09-16, a 50-bar live store became a 3-bar simulated
+            # one and none of the 50 could be read back. Nothing else in the bot
+            # can undo that, and watched bars are the one input the feed cannot
+            # re-supply, so refusing the write is the cheap side of this trade.
+            #
+            # Logged at most once per ``save_interval`` per symbol, because the
+            # gate above has just stamped the clock.
+            log.error(
+                "refusing to write %s bars over %s bars in %s — one feed per "
+                "store directory. Give the %s run its own CANDLE_STORE_DIR, or "
+                "delete the file to start this feed's series from scratch",
+                self.feed or "unnamed", foreign or "unnamed",
+                self._path(symbol).name, self.feed or "unnamed")
+            return
         merged = self._merge_with_disk(symbol, candles)[-self.max_bars:]
         doc = {
             "version": _SCHEMA_VERSION,
@@ -181,3 +228,91 @@ class CandleStore:
                 continue
             newest = mtime if newest is None else max(newest, mtime)
         return newest
+
+
+class CandleTiers:
+    """The store the engine reads, plus a deeper copy nothing reads but a replay.
+
+    ``MAX_BARS`` answers two questions at once, and they are not the same one: how
+    much history the live buffer may hold in memory, and how much history a
+    backtest can ever be run against. The first has to stay small — 20,000 bars
+    across twenty markets is a lot of objects to hold for indicators that read
+    dozens — while the second is the whole sample a selectivity dial can be
+    checked against, and it is what runs out first. Measured on 2026-09-16 the
+    shipped engine fires 0.2 times an hour, so the 30 held-out trades
+    ``calibrate.py`` wants need roughly 150h of history, three and a half times
+    what a 500-bar store can hold. Raising ``MAX_BARS`` to reach it would make the
+    live buffer exactly as heavy as the archive.
+
+    So the bars go to two places. The live tier is written and read exactly as
+    before, and is still the only one the engine ever sees; the archive tier takes
+    the same series with a much larger cap and a much slower write interval, and
+    is read only by ``backtest.py --dir``. A signal cannot depend on it, because
+    ``load`` here is the live store's ``load`` and nothing else — which is the
+    property worth keeping, so it is structural rather than a matter of care.
+
+    The archive's own writes are the same union-with-disk as the live store's, so
+    the bars survive the live store's truncation into it: a session that drops a
+    market, or a series that a gap truncates, still leaves the archive holding
+    everything that was ever watched.
+    """
+
+    def __init__(self, live: CandleStore, archive: Optional[CandleStore] = None,
+                 archive_interval: float = 900.0) -> None:
+        self.live = live
+        self.archive = archive
+        if archive is not None:
+            # The archive is a copy, not a buffer waiting to be resumed: it wants
+            # to be written rarely (the union makes the writes additive, so
+            # nothing is lost between them) and read never.
+            archive.save_interval = archive_interval
+        self.directory = live.directory
+        self.period = live.period
+        self.max_bars = live.max_bars
+
+    @property
+    def store(self) -> CandleStore:
+        """The tier the engine reads — kept for callers that name ``store``."""
+        return self.live
+
+    def load(self, symbol: str) -> list[Candle]:
+        return self.live.load(symbol)
+
+    def load_all(self, symbols: Iterable[str]) -> dict[str, list[Candle]]:
+        return self.live.load_all(symbols)
+
+    def seed(self, symbol: str, candles: Sequence[Candle]) -> bool:
+        """Give an empty archive the bars the live store already holds.
+
+        Without this the archive only ever learns bars from the moments it is
+        running, so a bot upgraded tonight would have an archive holding one
+        night's bars while the live store beside it held a day of them — the
+        deeper copy starting out shallower than the original, which is the one
+        thing it must not be. A symbol the archive already knows is left alone:
+        its own series is the union of everything ever watched, which is more
+        than the live store can show.
+        """
+        if self.archive is None or len(candles) < 2:
+            return False
+        if self.archive.load(symbol):
+            return False
+        self.archive.save(symbol, candles, force=True)
+        return True
+
+    def save(self, symbol: str, candles: Sequence[Candle], force: bool = False) -> None:
+        self.live.save(symbol, candles, force=force)
+        if self.archive is not None:
+            try:
+                self.archive.save(symbol, candles, force=force)
+            except Exception as exc:      # never let a copy end a session
+                log.warning("could not archive candles for %s: %s", symbol, exc)
+
+    def save_all(self, series_by_symbol: dict, force: bool = False) -> None:
+        for symbol, series in series_by_symbol.items():
+            self.save(symbol, series.closed(), force=force)
+
+    def archived(self, symbols: Iterable[str]) -> dict[str, list[Candle]]:
+        """What the archive holds, for a replay that asks for it directly."""
+        if self.archive is None:
+            return {}
+        return self.archive.load_all(symbols)

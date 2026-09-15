@@ -22,6 +22,10 @@ universe.json
 # history from before the period changed to 300s.
 candles/
 candles-1m-2026-09-15/
+# The deep copy of the same bars, and the one thing here that is *not*
+# regenerable: it is the only place a multi-day backtest sample can come from,
+# and deleting it throws away history no feed will hand back.
+candles-archive/
 
 # Bytecode and test caches
 __pycache__/

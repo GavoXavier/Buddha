@@ -95,12 +95,32 @@ calibrated against. The bar length changes what they mean — `MTF_FACTOR=5` is 
 `TREND_MIN_DISTANCE_PCT` is a move per 50 bars either way — so re-measure with
 `python backtest.py` once there are 5-minute bars to replay.
 
-**"Once there are bars" is not the same as "wait a couple of days".** The store is
-a rolling window, not an archive: it keeps the newest `MAX_BARS` per market and
-drops the oldest, so 500 bars of 5-minute candles is a span of ~41.7 hours that
-stops growing and starts sliding. Uptime past that adds no sample, and the sample
-is what the replay needs — `calibrate.py` prints this arithmetic rather than
-suggesting a wait that cannot help.
+**"Once there are bars" is not the same as "wait a couple of days".** The live
+store is a rolling window, not an archive: it keeps the newest `MAX_BARS` per
+market and drops the oldest, so 500 bars of 5-minute candles is a span of ~41.7
+hours that stops growing and starts sliding. Uptime past that adds no sample, and
+the sample is what the replay needs — `calibrate.py` prints this arithmetic rather
+than suggesting a wait that cannot help.
+
+**Which is why the bars are also kept a second time, far deeper.** `MAX_BARS`
+answers two different questions at once: how much history the live buffer may hold
+in memory, and how much a backtest can ever be run against. Only the second one
+needs to be large — 20,000 bars across twenty markets is a great many objects to
+hold for indicators that read a few dozen — so the same bars are written to a
+second directory with a much larger cap (`ARCHIVE_CANDLES`, `ARCHIVE_BARS`,
+`CANDLE_ARCHIVE_DIR`, beside the store by default). The archive is written on a
+slower clock (the write is a union with what is already there, so a rare write
+loses nothing), is never read by the engine — `CandleTiers.load` is the live
+store's own — and is what makes a multi-day sample reachable:
+
+```bash
+python backtest.py --dir candles-archive --bars 20000
+```
+
+The engine keeps reading a small warm buffer; the history it watched accumulates
+anyway. The ceiling quoted at the end of that run is the archive's own
+(`ARCHIVE_BARS × period`), not the live store's, because otherwise a replay of 69
+days would report the 41.7 hours a 500-bar store can hold.
 
 Measured on the shipped dials, replaying tick-built bars from a simulated run of
 three major pairs (`python backtest.py --dir <store>`, 8.3 hours, 500 minutes
@@ -201,8 +221,19 @@ how much history the sweep may read rather than what the engine does with a bar.
 the live store at 1.25 signals/hour, 30 held-out trades needs about 48h of store:
 `MAX_BARS=576` against the 500 in `.env`. That is a reachable number rather than a
 reproach — but while it is unraised the store is not merely failing to grow, it is
-*discarding* everything older than 41.7h, so it is worth raising before that history
-is gone rather than after.
+*discarding* everything older than 41.7h.
+
+**Sweep the archive instead.** That figure is about the store the tool was pointed
+at, and the deep copy holds the same bars with a far larger cap, so the sample is no
+longer bounded by the live buffer's memory:
+
+```bash
+python calibrate.py --dir candles-archive --bars 20000
+```
+
+Raising `MAX_BARS` is still the way to make the *live* store deeper, but nothing is
+lost by leaving it at 500 — the archive is what keeps the history, which is why it
+exists. See the store section above.
 
 Two things it cannot do, both stated in its own output:
 
@@ -239,7 +270,10 @@ engine sees is aggregated here from ticks this process actually received:
   a market that goes quiet is reported as stale and skipped.
 - Those bars are persisted (`CANDLE_STORE_DIR`), so a restart resumes with a warm
   buffer in seconds instead of spending another hour blind. Broker history could
-  never be used for this warm-up, for the reason above.
+  never be used for this warm-up, for the reason above. They are also written a
+  second time to the archive (`CANDLE_ARCHIVE_DIR`), which holds far more of them
+  and is read only by `backtest.py` and `calibrate.py` — see the sample section
+  above for why the two caps are different questions.
 - A hole longer than `MAX_GAP_BARS` bars **drops the bars before it** and the
   market warms up again. The indicators assume evenly spaced bars, so a window
   spanning a hole reads the whole outage as a single bar's move: after a
@@ -368,6 +402,17 @@ dropped); a market the feed has genuinely stopped offering is let go and one
 replaces it, so the size holds steady; and `ASSETS` still names a universe
 outright, with nothing to remember. Delete `universe.json` to choose afresh.
 
+The size it holds is the size of the set the filters describe — every OTC major
+pair, 28 of them — and not the count the feed happened to be offering when the
+file was written. That distinction is load-bearing rather than cosmetic: a refill
+only fires while the held list is shorter than the target, so a target equal to
+the current membership can only ever *shrink* to whatever the feed offers now.
+The membership was measured spanning 10 to 18 markets inside three hours
+(2026-09-15), which is the range that rule would have frozen the universe inside.
+Since the ranking still picks one market per bar, a wider universe does not mean
+more messages — it means the one pick is chosen from more candidates, and more
+markets get the unbroken runs that a signal needs to exist at all.
+
 ---
 
 ## Project layout
@@ -394,7 +439,7 @@ POCKET/
 │   └── ranking.py        # picking one market out of many
 ├── data/                 # base.py, pocket_option.py, simulated.py
 ├── telegram/             # sender.py (formatting), control.py (/commands)
-└── tests/                # 555 tests, ~20 seconds, no network
+└── tests/                # 584 tests, ~23 seconds, no network
 ```
 
 ## Setup
@@ -813,7 +858,10 @@ The ones worth knowing first:
 | `TREND_FLAT_MIN_SCORE` | `3` | evidence demanded in a flat market |
 | `USE_TREND` | `1` | the trend as a veto; `0` runs without it, and says so |
 | `TREND_EMA_LEN` | `50` | bars the trend EMA needs — with `TREND_SLOPE_BARS` this sets how deep a run must be before the veto exists (56) |
-| `MAX_BARS` | `500` | bars kept per market in memory and on disk — the ceiling on how much history a backtest can ever replay (~41.7h at 300s bars), and past it the store *discards* the oldest bars rather than growing, so raising it before the cap binds is what keeps the history. It changes no strategy; `calibrate.py` names the size this rate would need |
+| `MAX_BARS` | `500` | bars kept per market in memory and on disk — the live buffer's memory budget, and past it the store *discards* the oldest bars rather than growing |
+| `ARCHIVE_CANDLES` | `1` | write the same bars a second time, far deeper, in the archive |
+| `ARCHIVE_BARS` | `20000` | the archive's cap (~69 days at 300s bars); must exceed `MAX_BARS` |
+| `CANDLE_ARCHIVE_DIR` | *(blank)* | blank = beside `CANDLE_STORE_DIR` (`candles` → `candles-archive`) |
 | `MAX_GAP_BARS` | `5` | feed outage longer than this drops the bars before it |
 | `PERSIST_CANDLES` | `1` | keep bars on disk for a warm restart |
 | `JOURNAL_SIGNALS` | `1` | write the per-trade record `reconcile.py` reads |

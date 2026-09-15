@@ -3,6 +3,7 @@
     python backtest.py                 # every market in the store
     python backtest.py EURUSD_otc      # one market
     python backtest.py --hours 6       # only the most recent 6 hours
+    python backtest.py --dir candles-archive --bars 20000   # the deep archive
 
 **What this is for.** Not profit forecasting. It answers the two questions that
 cannot be answered by reading the code: *how often does this configuration
@@ -48,7 +49,14 @@ have gone out (a market that stopped ticking must not go on being judged from
 its stale tail at every later minute).
 
 **Sample size.** The store only holds what the bot has watched — an hour of
-uptime is an hour of sample. Treat anything under a few days as a rumour.
+uptime is an hour of sample — and only the last ``MAX_BARS`` of it, which at 300s
+bars is 41.7h. That cap is the binding constraint rather than the calendar:
+measured on 2026-09-16 the shipped engine fires 0.2 times an hour, so the 30
+held-out trades ``calibrate.py`` wants would need about 150h of history — three
+and a half times what the live store can hold, so no amount of uptime prints that
+table. The archive (``ARCHIVE_CANDLES``, read with ``--dir candles-archive``)
+holds the same bars far deeper and is where a multi-day sample comes from. Treat
+anything under a few days as a rumour.
 """
 
 from __future__ import annotations
@@ -83,11 +91,25 @@ class Store:
     """The persisted candle store, indexed for replay."""
 
     def __init__(self, directory: str | Path, cfg: Config, hours: float = 0.0,
-                 window: tuple[float, float] | None = None):
+                 window: tuple[float, float] | None = None, bars: int = 0):
         self.cfg = cfg
         # Match the feed this config would connect to, so replaying a simulated
         # store is not silently presented as a measurement of the live market.
-        self.store = CandleStore(directory, cfg.candle_period, cfg.max_bars,
+        #
+        # ``bars`` raises the loader's own cap, which is what makes the archive
+        # replayable: the live store and the archive hold the same bars, and the
+        # only difference is how deep each is allowed to keep them. Without it a
+        # replay of the archive would read its newest 500 bars and report a
+        # sample no longer than the live store's — silently, since the numbers
+        # would look exactly like a working measurement.
+        #
+        # It becomes ``self.max_bars`` rather than staying a local, because the
+        # cap is not only how much is read: it is what the window may reach back
+        # over, and what the ceiling quoted at the end of a run is made of. Left
+        # reading ``cfg.max_bars`` a replay of a 69-day archive would print "of
+        # 41.7h the cap allows" underneath 69 days of bars.
+        self.max_bars = bars or cfg.max_bars
+        self.store = CandleStore(directory, cfg.candle_period, self.max_bars,
                                  feed=cfg.feed)
         self.bars: dict[str, list[Candle]] = {}
         self.times: dict[str, list[float]] = {}
@@ -181,7 +203,7 @@ class Store:
         i = bisect_right(times, anchor)
         if i < 2 or abs(times[i - 1] - anchor) > 1e-6:
             return []
-        start = max(self.run_start[symbol][i - 1], i - self.cfg.max_bars)
+        start = max(self.run_start[symbol][i - 1], i - self.max_bars)
         if i - start < 2:
             return []
         return candles[start:i]
@@ -208,8 +230,13 @@ class Store:
         sliding instead. That is the ceiling on the sample a sweep can ever see, and
         the reason "leave it running a few more days" is not always an answer —
         ``calibrate.describe_pending`` does that arithmetic.
+
+        It is the cap this store was *read* with, which is ``MAX_BARS`` for the
+        live store and ``ARCHIVE_BARS`` for the archive (``--bars``). Quoting the
+        live cap while reading the archive would understate the ceiling by the
+        ratio of the two, which is the whole reason the archive exists.
         """
-        return self.cfg.max_bars * self.cfg.candle_period / 3600.0
+        return self.max_bars * self.cfg.candle_period / 3600.0
 
     def deepest_run(self) -> int:
         """Bars in the longest contiguous run any market offers.
@@ -494,7 +521,9 @@ class Replay:
                               for k, v in sorted(self.trends.items(), key=lambda r: -r[1])))
         print()
         print("Caveats: the sample is only as long as the bot has been running, and")
-        print(f"the store only keeps the last MAX_BARS={cfg.max_bars} bars per market.")
+        print(f"this store was read {self.store.max_bars} bars deep per market"
+              f"{' (--bars)' if self.store.max_bars != cfg.max_bars else ''}; "
+              f"the live store keeps MAX_BARS={cfg.max_bars}.")
         if cfg.lead_seconds < cfg.candle_period:
             print("This run has a short lead, so it judges bars the live loop sees")
             print("10 seconds early — its win rate is a ceiling, not a prediction.")
@@ -518,6 +547,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="only use the most recent N hours of stored bars")
     parser.add_argument("--dir", default=None,
                         help="candle store directory (default: CANDLE_STORE_DIR)")
+    parser.add_argument("--bars", type=int, default=0,
+                        help="bars per market to read (default: MAX_BARS; the "
+                             "archive holds ARCHIVE_BARS)")
     args = parser.parse_args(argv)
 
     try:
@@ -531,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_clock(cfg.market_tz_offset_hours)
 
     directory = args.dir or cfg.candle_store_dir
-    store = Store(directory, cfg, hours=args.hours)
+    store = Store(directory, cfg, hours=args.hours, bars=args.bars)
     if args.symbols:
         wanted = set(args.symbols)
         store.bars = {s: c for s, c in store.bars.items() if s in wanted}

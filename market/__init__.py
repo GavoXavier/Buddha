@@ -9,7 +9,7 @@ restart resumes warm, ``universe`` decides which markets are tradeable, and
 
 from .aggregator import CandleSeries, MarketState
 from .clock import Clock, RealClock, VirtualClock
-from .store import CandleStore
+from .store import CandleStore, CandleTiers
 from .universe import (
     MODE_ALL, MODE_FOREX, MODE_MAJOR, AssetMeta, describe_skipped, format_universe,
     is_currency_pair, is_major_pair, matches_mode, select_assets,
@@ -17,7 +17,8 @@ from .universe import (
 
 __all__ = [
     "CandleSeries", "MarketState", "Clock", "RealClock", "VirtualClock",
-    "CandleStore", "AssetMeta", "MODE_MAJOR", "MODE_FOREX", "MODE_ALL",
+    "CandleStore", "CandleTiers", "AssetMeta", "MODE_MAJOR", "MODE_FOREX",
+    "MODE_ALL",
     "is_currency_pair", "is_major_pair", "matches_mode", "select_assets",
     "describe_skipped", "format_universe",
 ]

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 
@@ -34,7 +35,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 if sys.stderr and hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
-from config import Config, ConfigError, load_config
+from config import Config, ConfigError, derived_archive_dir, load_config
 from data import DataFeed, SimulatedFeed
 from data.pocket_option import PocketOptionFeed
 from engine.scheduler import MinuteScheduler
@@ -42,7 +43,7 @@ from execution import DemoBroker
 from journal import SignalJournal, format_ev, load_journal
 from market.aggregator import MarketState
 from market.clock import Clock, RealClock
-from market.store import CandleStore
+from market.store import CandleStore, CandleTiers
 from market.universe import (
     AssetMeta, describe_skipped, format_universe, select_assets,
 )
@@ -280,6 +281,30 @@ def save_universe(path: str, symbols: list[str], target: int) -> None:
                     "from the feed's list on the next start", path, exc)
 
 
+def _archive_store(cfg: Config) -> CandleStore | None:
+    """The deeper copy of the candle store, or ``None`` when it is off.
+
+    Same bars, same format, far larger cap, read only by ``backtest.py --dir``.
+    It exists because ``MAX_BARS`` is both the live buffer's memory budget and
+    the whole sample a dial can be checked against, and only the second one needs
+    to be big — see ``CandleTiers``.
+    """
+    if not cfg.archive_candles:
+        return None
+    archive_dir = cfg.candle_archive_dir or derived_archive_dir(cfg.candle_store_dir)
+    if os.path.normcase(os.path.abspath(archive_dir)) == \
+            os.path.normcase(os.path.abspath(cfg.candle_store_dir)):
+        # Two tiers over one directory is not a deeper archive, it is the live
+        # store with a bigger file behind it: every live write would merge the
+        # whole deep series back in and then truncate it away again, paying for
+        # the archive on every save. Point CANDLE_ARCHIVE_DIR somewhere else.
+        log.warning("CANDLE_ARCHIVE_DIR is CANDLE_STORE_DIR - archiving is off; "
+                    "give the archive its own directory")
+        return None
+    return CandleStore(archive_dir, cfg.candle_period,
+                       cfg.archive_bars, feed=cfg.feed)
+
+
 # --------------------------------------------------------------------------
 # watchdog
 # --------------------------------------------------------------------------
@@ -355,17 +380,25 @@ async def trading_session(cfg: Config, feed: DataFeed, sender: TelegramSender | 
     if cfg.persist_candles:
         # The feed is part of the store's identity: bars from the simulator are
         # a fabricated price path and must never be restored as live history.
-        store = CandleStore(cfg.candle_store_dir, cfg.candle_period, cfg.max_bars,
-                            feed=cfg.feed)
+        live = CandleStore(cfg.candle_store_dir, cfg.candle_period, cfg.max_bars,
+                           feed=cfg.feed)
+        store = CandleTiers(live, _archive_store(cfg))
         restored = 0
+        seeded = 0
         for symbol in symbols:
             candles = store.load(symbol)
             if len(candles) >= 2:
                 market.track(symbol).restore(candles)
                 restored += 1
+                if store.seed(symbol, candles):
+                    seeded += 1
         if restored:
             log.info("restored %d market(s) from %s — warm start",
                      restored, cfg.candle_store_dir)
+        if store.archive is not None:
+            log.info("archiving candles to %s (up to %d bars per market)%s",
+                     store.archive.directory, cfg.archive_bars,
+                     f", seeded {seeded}" if seeded else "")
 
     await feed.subscribe(symbols)
 

@@ -9,7 +9,7 @@ import os
 import unittest
 import unittest.mock
 
-from config import ConfigError, load_config
+from config import ConfigError, derived_archive_dir, load_config
 
 
 class ConfigCase(unittest.TestCase):
@@ -165,6 +165,37 @@ class TestValidation(ConfigCase):
 
     def test_buffer_too_small_to_warm_up(self):
         self.assert_rejected("MAX_BARS", MAX_BARS="50")
+
+    def test_an_archive_shallower_than_the_live_store_is_refused(self):
+        # It would be a copy that holds less than the original, which is the one
+        # arrangement with no reason to exist. Off is the way to say no archive.
+        message = self.assert_rejected("ARCHIVE_BARS", MAX_BARS="500",
+                                       ARCHIVE_BARS="400")
+        self.assertIn("shallower than MAX_BARS", message)
+
+    def test_the_archive_depth_is_only_checked_while_it_is_on(self):
+        cfg = self.load(ARCHIVE_CANDLES="0", MAX_BARS="500", ARCHIVE_BARS="400")
+        self.assertFalse(cfg.archive_candles)
+
+    def test_the_archive_is_unnamed_by_default_so_it_can_follow_the_store(self):
+        # Not "candles-archive": the archive is the same store read deeper, so
+        # where it goes has to follow CANDLE_STORE_DIR rather than being a second
+        # path that can drift from it. A fixed default meant a caller that
+        # redirected its store left the archive writing into the working tree.
+        self.assertEqual(self.load().candle_archive_dir, "")
+
+    def test_an_unnamed_archive_is_derived_beside_the_store(self):
+        # ``candles`` -> ``candles-archive``; ``data/candles/`` -> the sibling of
+        # the store rather than a directory inside it.
+        self.assertEqual(derived_archive_dir("candles"), "candles-archive")
+        self.assertEqual(derived_archive_dir("data/candles/"),
+                         "data/candles-archive")
+        self.assertEqual(derived_archive_dir("data\\candles"),
+                         "data\\candles-archive")
+
+    def test_a_named_archive_directory_is_used_as_given(self):
+        self.assertEqual(self.load(CANDLE_ARCHIVE_DIR="D:/deep").candle_archive_dir,
+                         "D:/deep")
 
     def test_payout_out_of_range(self):
         self.assert_rejected("MIN_PAYOUT", MIN_PAYOUT="150")

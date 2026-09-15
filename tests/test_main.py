@@ -18,8 +18,9 @@ from pathlib import Path
 
 from config import Config
 from main import (
-    BACKOFF_MAX, BACKOFF_MIN, HEALTHY_SESSION_SECONDS, WakeLock, backoff_step,
-    healthy_session_seconds, load_universe, resolve_universe, save_universe,
+    BACKOFF_MAX, BACKOFF_MIN, HEALTHY_SESSION_SECONDS, WakeLock, _archive_store,
+    backoff_step, healthy_session_seconds, load_universe, resolve_universe,
+    save_universe,
 )
 from market.universe import AssetMeta
 
@@ -293,6 +294,42 @@ class TestUniverseSurvivesARestart(unittest.TestCase):
         }, sticky)
 
         self.assertEqual(kept, ["EURUSD_otc"])
+
+
+class TestWhereTheArchiveLives(unittest.TestCase):
+    """The archive must land beside whatever store it is copying.
+
+    A fixed default put it in the working directory, so any caller that
+    redirected ``candle_store_dir`` — a test into a temp directory, an operator
+    to another disk — left the archive behind in the current directory instead.
+    That was measured rather than imagined: five files of simulated bars were
+    written into the repo's own ``candles-archive/`` by a test run on 2026-09-16.
+    """
+
+    def test_an_unnamed_archive_sits_beside_the_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(candle_store_dir=str(Path(tmp) / "candles"))
+            store = _archive_store(cfg)
+
+            self.assertEqual(Path(store.directory), Path(tmp) / "candles-archive")
+
+    def test_archiving_can_be_turned_off(self):
+        self.assertIsNone(_archive_store(Config(archive_candles=False)))
+
+    def test_one_directory_for_both_tiers_is_refused(self):
+        # Two tiers over one directory is not a deeper archive: every live write
+        # would merge the deep series back in and truncate it away again.
+        cfg = Config(candle_store_dir="candles", candle_archive_dir="candles")
+        self.assertIsNone(_archive_store(cfg))
+
+    def test_the_archive_is_deeper_than_the_store_and_reads_the_same_feed(self):
+        cfg = Config(candle_store_dir="candles", max_bars=500, archive_bars=20000,
+                     feed="pocket_option")
+        store = _archive_store(cfg)
+
+        self.assertEqual(store.max_bars, 20000)
+        self.assertEqual(store.feed, "pocket_option", "the feed stamp comes along")
+        self.assertEqual(store.period, cfg.candle_period)
 
 
 class TestBackoffStep(unittest.TestCase):

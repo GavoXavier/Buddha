@@ -106,6 +106,31 @@ class TestStoreIndex(BacktestCase):
 
         self.assertLessEqual(store.span_hours(), store.ceiling_hours())
 
+    def test_a_deeper_store_can_be_read_in_full(self):
+        # What makes the archive replayable. The file holds far more than
+        # MAX_BARS — it was written with its own, larger cap — and without this
+        # the replay would read its newest MAX_BARS and report a sample no longer
+        # than the live store's, silently, since the numbers would look exactly
+        # like a working measurement.
+        self.write_store(self.straight(count=40))
+        cfg = make_config(max_bars=10)
+
+        self.assertEqual(len(backtest.Store(self.dir, cfg).bars["AAA_otc"]), 10)
+        deeper = backtest.Store(self.dir, cfg, bars=40)
+        self.assertEqual(len(deeper.bars["AAA_otc"]), 40)
+        self.assertAlmostEqual(deeper.ceiling_hours(), 40 * PERIOD / 3600.0)
+
+    def test_the_hours_window_still_applies_to_a_deeper_read(self):
+        # ``--bars`` raises the ceiling; it does not override ``--hours``. The two
+        # are asked for separately and neither should quietly win.
+        self.write_store(self.straight(count=40))
+        store = backtest.Store(self.dir, make_config(max_bars=10), hours=0.5,
+                               bars=40)
+
+        # 31, not 30: the cutoff is inclusive, so the bar exactly half an hour
+        # before the newest one is still inside the window.
+        self.assertEqual(len(store.bars["AAA_otc"]), 31)
+
 
 class TestHowMuchOfTheStoreCanWarmTheTrendVeto(BacktestCase):
     """Reachability, which is the one dial effect the settings cannot show.

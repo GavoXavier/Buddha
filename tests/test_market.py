@@ -7,7 +7,7 @@ from pathlib import Path
 
 from market.aggregator import CandleSeries, MarketState, contiguous_runs
 from market.clock import VirtualClock
-from market.store import CandleStore
+from market.store import CandleStore, CandleTiers
 from market.universe import (
     AssetMeta, MODE_ALL, MODE_FOREX, MODE_MAJOR, describe_skipped,
     is_currency_pair, is_major_pair, matches_mode, select_assets,
@@ -525,14 +525,230 @@ class TestCandleStore(unittest.TestCase):
 
     def test_a_foreign_store_is_not_merged_into(self):
         # The merge reads the disk through ``load``, so it inherits the same
-        # discarding rules: a save must not resurrect bars that the period or
-        # feed checks just rejected.
-        CandleStore(self.dir, 60, 100, feed="simulated").save(
+        # discarding rules: a save must not resurrect bars that the period check
+        # has just rejected. The feed check goes further and refuses the write
+        # outright — see below — so the period is what shows the merge rule alone.
+        CandleStore(self.dir, 300, 100).save(
             "EURUSD_otc", [Candle(BASE, 1, 1, 1, 1)], force=True)
-        live = CandleStore(self.dir, 60, 100, feed="pocket_option")
+        live = CandleStore(self.dir, 60, 100)
         live.save("EURUSD_otc", [Candle(BASE + 60, 2, 2, 2, 2)], force=True)
 
         self.assertEqual([c.time for c in live.load("EURUSD_otc")], [BASE + 60])
+
+    def test_a_save_will_not_overwrite_another_feeds_history(self):
+        # Read-discarding is not enough on its own. A simulated session in the
+        # live store's directory reads nothing (the feed check) and then writes
+        # over everything, because the merge it does on the way out sees an empty
+        # disk. Measured on 2026-09-16: a 50-bar live store became a 3-bar
+        # simulated one, and none of the 50 could be read back afterwards. The
+        # watched bars are the one input the broker will not re-supply.
+        live = CandleStore(self.dir, 60, 100, feed="pocket_option")
+        live.save("EURUSD_otc", [Candle(BASE + i * 60, 1, 1, 1, 1)
+                                 for i in range(50)], force=True)
+
+        CandleStore(self.dir, 60, 100, feed="simulated").save(
+            "EURUSD_otc", [Candle(BASE + 900000, 9, 9, 9, 9)], force=True)
+
+        kept = live.load("EURUSD_otc")
+        self.assertEqual(len(kept), 50, "the real history is untouched")
+        self.assertEqual(kept[0].close, 1.0, "and it is still the real bars")
+
+    def test_the_refusal_is_per_file_rather_than_per_directory(self):
+        # The two feeds share a store directory in practice; what must not be
+        # shared is a single market's series. A market the other feed has never
+        # written stays writable, so a simulated run beside a live one is only
+        # refused the files it would actually destroy.
+        CandleStore(self.dir, 60, 100, feed="pocket_option").save(
+            "EURUSD_otc", [Candle(BASE, 1, 1, 1, 1)], force=True)
+
+        sim = CandleStore(self.dir, 60, 100, feed="simulated")
+        sim.save("GBPUSD_otc", [Candle(BASE, 2, 2, 2, 2)], force=True)
+
+        self.assertEqual(len(sim.load("GBPUSD_otc")), 1)
+
+    def test_a_file_that_cannot_be_read_is_still_written_over(self):
+        # A corrupt or half-written file is not history: there is nothing behind
+        # it to protect, and refusing would leave the market permanently unable
+        # to store anything.
+        (self.dir / "EURUSD_otc.json").write_text("{not json", encoding="utf-8")
+        self.store.save("EURUSD_otc", [Candle(BASE, 1, 1, 1, 1)], force=True)
+
+        self.assertEqual(len(self.store.load("EURUSD_otc")), 1)
+
+    def test_a_file_of_unknown_origin_is_not_written_over_either(self):
+        # Written before the feed field existed. It cannot be shown to be the
+        # right feed, so it is not read from — and by the same rule it is not
+        # written over, because it may well be real history.
+        (self.dir / "EURUSD_otc.json").write_text(
+            json.dumps({"version": 1, "period": 60, "asset": "EURUSD_otc",
+                        "candles": [[BASE, 1, 1, 1, 1]]}), encoding="utf-8")
+        live = CandleStore(self.dir, 60, 100, feed="pocket_option")
+        live.save("EURUSD_otc", [Candle(BASE + 60, 2, 2, 2, 2)], force=True)
+
+        self.assertEqual(live.load("EURUSD_otc"), [])
+
+    def test_a_refused_write_is_logged_at_most_once_per_interval(self):
+        # Otherwise a simulated session beside a live one logs an error per
+        # market per bar, which is how a real warning gets scrolled away.
+        live = CandleStore(self.dir, 60, 100, feed="pocket_option")
+        live.save("EURUSD_otc", [Candle(BASE, 1, 1, 1, 1)], force=True)
+        sim = CandleStore(self.dir, 60, 100, feed="simulated")
+        with self.assertLogs("pocket.store", level="ERROR") as caught:
+            for i in range(5):
+                sim.save("EURUSD_otc", [Candle(BASE + 900000 + i * 60, 9, 9, 9, 9)])
+
+        self.assertEqual(len(caught.records), 1)
+
+
+class _Series:
+    """Enough of ``CandleSeries`` for ``save_all``: what would be written out."""
+
+    def __init__(self, candles):
+        self._candles = candles
+
+    def closed(self):
+        return list(self._candles)
+
+
+class TestCandleTiers(unittest.TestCase):
+    """The live store, plus a deeper copy that only a replay ever reads.
+
+    ``MAX_BARS`` is two decisions in one setting — the live buffer's memory, and
+    the whole sample a selectivity dial can be checked against — and the second
+    one is what runs out. These pin that the two tiers can differ in depth
+    without the engine ever seeing the deeper one.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.live_dir = Path(self.tmp.name) / "candles"
+        self.deep_dir = Path(self.tmp.name) / "candles-archive"
+        self.addCleanup(self.tmp.cleanup)
+
+    def tiers(self, live_bars=3, deep_bars=50, feed=""):
+        live = CandleStore(self.live_dir, 60, live_bars, feed=feed)
+        deep = CandleStore(self.deep_dir, 60, deep_bars, feed=feed)
+        return CandleTiers(live, deep), deep
+
+    @staticmethod
+    def series(count, start=0, close=1.0):
+        return [Candle(BASE + (start + i) * 60, close, close, close, close)
+                for i in range(count)]
+
+    def test_the_engine_reads_the_live_tier_only(self):
+        # The archive holds bars the live store was never given. If ``load``
+        # could reach them the archive would be a strategy change wearing the
+        # label of a storage one.
+        tiers, deep = self.tiers()
+        deep.save("EURUSD_otc", self.series(9), force=True)
+
+        self.assertEqual(tiers.load("EURUSD_otc"), [])
+        self.assertEqual(len(deep.load("EURUSD_otc")), 9)
+
+    def test_the_archive_keeps_what_the_live_store_discards(self):
+        tiers, deep = self.tiers(live_bars=3, deep_bars=50)
+        tiers.save("EURUSD_otc", self.series(10), force=True)
+
+        self.assertEqual(len(tiers.load("EURUSD_otc")), 3, "the live cap still applies")
+        self.assertEqual(len(deep.load("EURUSD_otc")), 10)
+
+    def test_one_save_reaches_both_tiers(self):
+        tiers, deep = self.tiers()
+        tiers.save_all({"EURUSD_otc": _Series(self.series(4))}, force=True)
+
+        self.assertEqual(len(tiers.load("EURUSD_otc")), 3)
+        self.assertEqual(len(deep.load("EURUSD_otc")), 4)
+
+    def test_the_live_buffer_and_the_archive_keep_the_same_bars(self):
+        # Not merely the same count: a bar the live store kept must be the bar
+        # the archive kept, or a replay would be measuring a different market.
+        tiers, deep = self.tiers(live_bars=3, deep_bars=50)
+        tiers.save("EURUSD_otc", self.series(10), force=True)
+
+        self.assertEqual([c.time for c in tiers.load("EURUSD_otc")],
+                         [c.time for c in deep.load("EURUSD_otc")][-3:])
+
+    def test_the_archive_is_written_on_its_own_slower_clock(self):
+        # It is a copy, not a buffer waiting to be resumed: rewriting a
+        # 20,000-bar file every thirty seconds would be all cost and no gain,
+        # because the merge makes each write additive anyway.
+        tiers, deep = self.tiers()
+
+        self.assertEqual(deep.save_interval, 900.0)
+        self.assertGreater(deep.save_interval, tiers.live.save_interval)
+
+    def test_a_truncated_series_does_not_shrink_the_archive(self):
+        # The aggregator drops every bar before a long hole, so a shorter series
+        # is legitimate. The archive inherits the live store's union-with-disk,
+        # which is what stops a hole in one session deleting history from the
+        # copy that exists to remember it.
+        tiers, deep = self.tiers(live_bars=500, deep_bars=500)
+        tiers.save("EURUSD_otc", self.series(20), force=True)
+        tiers.save("EURUSD_otc", self.series(2, start=20), force=True)
+
+        self.assertEqual(len(deep.load("EURUSD_otc")), 22)
+
+    def test_an_unwritable_archive_does_not_end_the_save(self):
+        # A copy is a convenience. A mistyped CANDLE_ARCHIVE_DIR must cost the
+        # copy and not the session, or archiving would be a way to lose trades.
+        blocked = Path(self.tmp.name) / "not-a-directory"
+        blocked.write_text("", encoding="utf-8")
+        tiers = CandleTiers(CandleStore(self.live_dir, 60, 3),
+                            CandleStore(blocked, 60, 50))
+
+        tiers.save("EURUSD_otc", self.series(5), force=True)
+
+        self.assertEqual(len(tiers.load("EURUSD_otc")), 3)
+
+    def test_no_archive_is_a_live_store_with_a_wrapper(self):
+        tiers = CandleTiers(CandleStore(self.live_dir, 60, 3))
+        tiers.save("EURUSD_otc", self.series(5), force=True)
+
+        self.assertIsNone(tiers.archive)
+        self.assertEqual(len(tiers.load("EURUSD_otc")), 3)
+        self.assertEqual(tiers.archived(["EURUSD_otc"]), {})
+
+    def test_seeding_gives_an_empty_archive_the_history_beside_it(self):
+        # Without this an upgraded bot would start an archive that is shallower
+        # than the live store next to it — the deeper copy holding less than the
+        # original.
+        tiers, deep = self.tiers(live_bars=20, deep_bars=50)
+        candles = self.series(20)
+        # History that predates the archive: the live store has it and the new
+        # directory does not, which is what an upgrade looks like.
+        tiers.live.save("EURUSD_otc", candles, force=True)
+        self.assertEqual(deep.load("EURUSD_otc"), [])
+
+        self.assertTrue(tiers.seed("EURUSD_otc", candles))
+        self.assertEqual(len(deep.load("EURUSD_otc")), 20)
+
+    def test_seeding_leaves_an_archive_that_already_has_history_alone(self):
+        # The archive's own series is the union of everything ever watched, so
+        # it can hold runs the live store's cap has already trimmed away.
+        # Seeding over it would be the copy overwriting the original.
+        tiers, deep = self.tiers(live_bars=20, deep_bars=50)
+        deep.save("EURUSD_otc", self.series(40), force=True)
+        candles = self.series(3)
+
+        self.assertFalse(tiers.seed("EURUSD_otc", candles))
+        self.assertEqual(len(deep.load("EURUSD_otc")), 40)
+
+    def test_there_is_nothing_to_seed_from_one_bar(self):
+        tiers, _ = self.tiers()
+        self.assertFalse(tiers.seed("EURUSD_otc", self.series(1)))
+
+    def test_seeding_without_an_archive_is_a_no_op(self):
+        tiers = CandleTiers(CandleStore(self.live_dir, 60, 3))
+        self.assertFalse(tiers.seed("EURUSD_otc", self.series(9)))
+
+    def test_the_archive_carries_the_live_stores_own_feed_stamp(self):
+        # The feed is what stops simulated bars being replayed as live ones, and
+        # a second writer is a second chance to lose that stamp.
+        tiers, deep = self.tiers(feed="simulated")
+        tiers.save("EURUSD_otc", self.series(4), force=True)
+
+        self.assertEqual(deep.feed, "simulated")
+        self.assertEqual(CandleStore(self.deep_dir, 60, 50).load("EURUSD_otc"), [])
 
 
 def meta(symbol, payout=85, is_otc=None, active=True):

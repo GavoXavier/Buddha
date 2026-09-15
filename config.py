@@ -89,6 +89,23 @@ class Config:
     max_gap_bars: int = 5
     candle_store_dir: str = "candles"
     persist_candles: bool = True
+    # A second copy of the same bars, kept far deeper than the live store, in its
+    # own directory and read only by the replay tool. MAX_BARS is a memory
+    # decision about the live buffer and *also* the ceiling on how much history a
+    # backtest can ever have — the two are not the same question, and at 0.2
+    # signals/hour the sample the dials need is three times what that ceiling
+    # holds. Archiving decouples them: the engine keeps reading a small warm
+    # buffer, and the history it has watched accumulates anyway. Nothing here
+    # reaches the engine, so it cannot change a signal.
+    archive_candles: bool = True
+    # Empty means "beside CANDLE_STORE_DIR" (``candles`` -> ``candles-archive``),
+    # resolved in ``load_config``. The archive is the same store read deeper, so
+    # its location has to follow the store's rather than be a second absolute
+    # path that can drift from it — and a caller that redirects the store (a test
+    # into a temp directory, say) must not leave the archive writing into the
+    # working tree, which is exactly what a fixed default did.
+    candle_archive_dir: str = ""
+    archive_bars: int = 20000
 
     # --- telegram ---
     telegram_bot_token: str = ""
@@ -229,6 +246,12 @@ def _validate(cfg: Config) -> None:
             f"{cfg.candle_period} or healthy markets would be dropped mid-bar")
     if cfg.max_bars < 100:
         raise ConfigError(f"MAX_BARS={cfg.max_bars} is too small to hold a warm buffer")
+    if cfg.archive_candles and cfg.archive_bars < cfg.max_bars:
+        # An archive shallower than the live store would be a copy that holds
+        # less than the original — the one arrangement with no reason to exist.
+        raise ConfigError(
+            f"ARCHIVE_BARS={cfg.archive_bars} is shallower than MAX_BARS="
+            f"{cfg.max_bars}; the archive is the deeper copy and must not be")
     if cfg.max_gap_bars < 0:
         raise ConfigError("MAX_GAP_BARS cannot be negative")
     if cfg.min_payout < 0 or cfg.min_payout > 100:
@@ -290,6 +313,9 @@ def load_config() -> Config:
         max_gap_bars=_int("MAX_GAP_BARS", 5),
         candle_store_dir=_get("CANDLE_STORE_DIR", "candles"),
         persist_candles=_bool("PERSIST_CANDLES", True),
+        archive_candles=_bool("ARCHIVE_CANDLES", True),
+        candle_archive_dir=_get("CANDLE_ARCHIVE_DIR").strip(),
+        archive_bars=_int("ARCHIVE_BARS", 20000),
         telegram_bot_token=_get("TELEGRAM_BOT_TOKEN").strip(),
         telegram_chat_id=_get("TELEGRAM_CHAT_ID").strip(),
         expiry=expiry,
@@ -312,3 +338,17 @@ def load_config() -> Config:
     )
     _validate(cfg)
     return cfg
+
+
+def derived_archive_dir(store_dir: str) -> str:
+    """Where the archive lives when it is not named: beside the store it copies.
+
+    ``candles`` -> ``candles-archive``, dropping only a trailing separator, so
+    ``data/candles/`` gives ``data/candles-archive/``. Derived here rather than
+    defaulted in the dataclass because the answer depends on ``CANDLE_STORE_DIR``,
+    and it is derived at the point of use rather than stored so that a ``Config``
+    built by hand (a test's) resolves the same way a loaded one does — the
+    alternative wrote test data into the working tree.
+    """
+    trimmed = str(store_dir).rstrip("/\\")
+    return f"{trimmed}-archive" if trimmed else "candles-archive"

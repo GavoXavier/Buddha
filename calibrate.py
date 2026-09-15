@@ -321,24 +321,26 @@ def reading(rows: list[tuple[str, dict, dict]], break_even: float) -> str:
 
 # ---------------------------------------------------------------------------
 def sweep(cfg: Config, directory: str, hours: float, split: float,
-          payout: float, min_trades: int) -> int:
-    full = Store(directory, cfg, hours=hours)
+          payout: float, min_trades: int, bars: int = 0) -> int:
+    full = Store(directory, cfg, hours=hours, bars=bars)
     span = full.span_hours()
     break_even = break_even_win_rate(payout)
 
     print(f"Candle store: {directory}")
     print(f"Period {cfg.candle_period}s · expiry {cfg.expiry} · "
           f"cooldown {cfg.cooldown_seconds}s · lead {cfg.lead_seconds}s")
+    if bars:
+        print(f"Reading {full.max_bars} bars per market (--bars)")
     if not full.bars:
         print("\nNo bars in the store for this feed and bar length — nothing to sweep.")
         return 1
 
-    bars = sum(len(b) for b in full.bars.values())
-    print(f"{bars} bars over {len(full.bars)} markets, {span:.1f}h")
+    bars_total = sum(len(b) for b in full.bars.values())
+    print(f"{bars_total} bars over {len(full.bars)} markets, {span:.1f}h")
 
     cut = split_at(full, split)
-    train = Store(directory, cfg, hours=hours, window=(0.0, cut))
-    test = Store(directory, cfg, hours=hours, window=(cut, float("inf")))
+    train = Store(directory, cfg, hours=hours, window=(0.0, cut), bars=bars)
+    test = Store(directory, cfg, hours=hours, window=(cut, float("inf")), bars=bars)
     train_hours, test_hours = train.span_hours(), test.span_hours()
 
     print(f"Split at {_clock(cut)}: train {train_hours:.1f}h, "
@@ -384,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Sweep the selectivity dials, on bars held back from the sweep.")
     parser.add_argument("--dir", default=None,
                         help="candle store directory (default: from .env)")
+    parser.add_argument("--bars", type=int, default=0,
+                        help="bars per market to read (default: MAX_BARS; "
+                             "ARCHIVE_BARS to sweep the archive)")
     parser.add_argument("--hours", type=float, default=0.0,
                         help="only the most recent N hours of the store (0 = all)")
     parser.add_argument("--split", type=float, default=0.6,
@@ -409,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.dir:
         cfg = replace(cfg, candle_store_dir=args.dir)
     return sweep(cfg, directory, args.hours, args.split, args.payout,
-                 args.min_trades)
+                 args.min_trades, args.bars)
 
 
 if __name__ == "__main__":
