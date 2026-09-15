@@ -166,17 +166,28 @@ class PocketOptionFeed(DataFeed):
             ) from None
 
     async def close(self) -> None:
+        """Let go of the transport, whatever the transport does about it.
+
+        A failed disconnect does not change what happens next — the client is
+        dropped either way, so the process can still exit — which is why it is
+        swallowed. Logged at debug rather than warning for the same reason, and
+        logged at all so that "the socket took three seconds to let go" is
+        answerable from the log instead of only from a stack trace that never
+        appears.
+        """
         if self._client is not None:
             try:
                 await self._client.disconnect()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("disconnect raised on close, dropping the client anyway: %r",
+                          exc)
             self._client = None
         if self._http_session is not None:
             try:
                 await self._http_session.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug("closing the HTTP session raised, dropping it anyway: %r",
+                          exc)
             self._http_session = None
         self._subscribed.clear()
 

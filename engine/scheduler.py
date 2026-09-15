@@ -74,7 +74,18 @@ def next_boundary(now: float, period: int) -> int:
 def outcome_of(direction: str, entry: float, exit_price: float) -> str:
     """WIN if price moved the signal's way between entry and expiry.
 
-    A tie counts as a loss, matching how a flat close settles a binary option.
+    A tie counts as a **loss**, and that is an assumption rather than a fact
+    about the broker: a flat close may just as well be refunded, and nothing here
+    has settled an option at exactly its entry price to find out. It has never
+    fired — 0 of the 36 settled trades in the live record had equal entry and exit
+    prices — so it is left as it is, and named for what it is.
+
+    What would catch it is ``reconcile.py``: a deal with ``profit == 0`` is
+    reported there as a refund and counted as a third outcome, so our "LOSS"
+    against their refund shows up as a disagreement with both directions named.
+    With ``AUTO_TRADE=1`` the broker's answer already wins — ``outcome_of_record``
+    prefers it — so this rule is only ever consulted in signal-only mode, which is
+    exactly the mode where the answer is a guess.
     """
     if direction == "CALL":
         return "WIN" if exit_price > entry else "LOSS"
