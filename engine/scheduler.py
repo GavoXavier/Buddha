@@ -278,9 +278,16 @@ class MinuteScheduler:
                      ", ".join(f"{t.asset} {t.direction} entered {_stamp(t.entry_at)}"
                                for t in adopted))
         if unpriced:
-            log.warning("%d journalled signal(s) cannot be settled — their bars are "
-                        "no longer on disk, so there is no price to settle them at. "
-                        "Left unsettled: %s", len(unpriced), ", ".join(unpriced))
+            # Permanent, and worth saying so: the bars for a window in the past can
+            # only come from the store, the store never rewrites a past window, and
+            # so a signal whose bars are already gone at startup is unsettleable for
+            # good. Named rather than summarised because ``reconcile.py`` takes these
+            # ids, and reported here rather than only in the record line because this
+            # is the one place that knows *why* they will never settle.
+            log.warning("%d journalled signal(s) can never be settled: their bars are "
+                        "no longer on disk, so there is no price to settle them at, and "
+                        "a window in the past is never written again. They stay in the "
+                        "record as never settled: %s", len(unpriced), ", ".join(unpriced))
         return adopted
 
     async def run_cycle(self, boundary: int) -> CycleResult:

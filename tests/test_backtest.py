@@ -93,6 +93,57 @@ class TestStoreIndex(BacktestCase):
         self.assertEqual(len(store.buffer_for("AAA_otc", BASE + 40 * PERIOD)), 10)
 
 
+class TestHowMuchOfTheStoreCanWarmTheTrendVeto(BacktestCase):
+    """Reachability, which is the one dial effect the settings cannot show.
+
+    The trend veto needs ``TREND_EMA_LEN + TREND_SLOPE_BARS + 1`` bars of one
+    unbroken run. A gate that is never warm is not a filter being applied, it is a
+    filter that is not there — so the tool that reports the store has to report
+    what depth of gate it could have supported.
+    """
+
+    # SignalConfig's defaults: 50 + 5 + 1 = 56, which no run here reaches.
+    def test_a_run_too_shallow_for_the_gate_scores_nothing(self):
+        self.write_store(self.straight(count=20))
+        store = backtest.Store(self.dir, make_config())
+
+        self.assertEqual(store.gate_reachability([50]), [(50, 0, 0.0)])
+
+    def test_a_run_warms_the_gate_from_its_k_th_bar_onward(self):
+        # 20 bars, a gate needing 16: warm for the last 5 of them.
+        self.write_store(self.straight(count=20))
+        store = backtest.Store(self.dir, make_config())
+
+        self.assertEqual(store.gate_reachability([10]), [(10, 5, 0.25)])
+
+    def test_a_shallower_gate_is_available_more_often(self):
+        self.write_store(self.straight(count=40))
+        store = backtest.Store(self.dir, make_config())
+
+        rows = store.gate_reachability([10, 20, 30])
+        shares = [share for _length, _warm, share in rows]
+
+        self.assertEqual(shares, sorted(shares, reverse=True),
+                         "a gate that needs fewer bars cannot be available less")
+
+    def test_two_shallow_runs_are_not_one_deep_one(self):
+        # The point of splitting by contiguity: bars either side of a hole are not
+        # 40 bars of history, they are two 20-bar histories, and neither warms a
+        # 26-bar gate.
+        first = [bar(BASE + i * PERIOD, 1.0) for i in range(20)]
+        second = [bar(BASE + (i + 40) * PERIOD, 1.0) for i in range(20)]
+        self.write_store({"AAA_otc": first + second})
+        store = backtest.Store(self.dir, make_config())
+
+        self.assertEqual(len(store.runs["AAA_otc"]), 2)
+        self.assertEqual(store.gate_reachability([20]), [(20, 0, 0.0)])
+
+    def test_an_empty_store_has_a_share_rather_than_a_zero_division(self):
+        store = backtest.Store(self.dir / "nope", make_config())
+
+        self.assertEqual(store.gate_reachability([10]), [(10, 0, 0.0)])
+
+
 class TestReplayPlumbing(BacktestCase):
     """With the engine stubbed out, only the replay's bookkeeping is under test."""
 

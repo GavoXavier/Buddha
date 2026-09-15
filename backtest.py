@@ -23,11 +23,16 @@ a market that was never traded. The only honest input is the candle store the
 bot built from ticks it actually received — one JSON file per market under
 CANDLE_STORE_DIR.
 
-**Known optimism.** A live signal is judged 10s before the bar closes, on a bar
-that still has 10 seconds of ticks to come; here the bar is complete. So the
-backtest sees slightly more information than the bot does, and its win rate is a
-ceiling rather than a prediction. Signals also carry no payout here (the store
-does not record one), so ranking ties fall through to the symbol name.
+**Known optimism, and only at a short lead.** On the shipped full-bar lead the
+replay judges exactly the bar set the live loop judges — ``buffer_for`` stops the
+window one bar short of the entry bar, matching the live ``series.closed()`` — so
+there is no hindsight in it at all. The optimism belongs to a *short* lead
+(``SIGNAL_LEAD_SECONDS < CANDLE_PERIOD``, the original 1-minute rhythm): there the
+live loop judges a bar 10 seconds before it closes, on a bar that still has ticks
+to come, and this replay sees that bar complete — slightly more information than
+the bot had, so its win rate is a ceiling rather than a prediction. Signals also
+carry no payout here (the store does not record one), so ranking ties fall through
+to the symbol name.
 
 **What a store file is not.** It is not a series. ``CandleStore.save`` is
 additive — a hole may not delete history, so each session's bars are unioned with
@@ -182,6 +187,33 @@ class Store:
         """
         return max((len(run) for runs in self.runs.values() for run in runs),
                    default=0)
+
+    def gate_reachability(self, lengths: list[int]) -> list[tuple[int, int, float]]:
+        """For each candidate trend EMA length: (length, bars, share).
+
+        A run of ``n`` contiguous bars warms a gate needing ``k`` at the ``k``-th
+        bar and stays warm for the ``n - k + 1`` after that, so the share of the
+        store's *bars* a gate of that depth could have judged is that, summed over
+        every run, over the total bar count.
+
+        This exists because ``TREND_EMA_LEN`` is the one dial whose effect is
+        invisible from the settings alone: at 50 bars the veto needs 56, which a
+        churning universe may never provide, and a gate that is never warm is not
+        a filter being applied — it is a filter that is not there. Measuring
+        reachability is what makes shortening it a decision instead of a guess.
+
+        It measures *availability*, not usefulness. A shorter EMA is available
+        more often and is also a noisier reading of the trend; nothing here can
+        say which of those wins, and it deliberately does not try.
+        """
+        total = sum(len(bars) for bars in self.bars.values())
+        rows = []
+        for length in lengths:
+            need = length + self.cfg.signal.trend_slope_bars + 1
+            warm = sum(max(0, len(run) - need + 1)
+                       for runs in self.runs.values() for run in runs)
+            rows.append((length, warm, warm / total if total else 0.0))
+        return rows
 
 
 class Replay:
@@ -359,6 +391,17 @@ class Replay:
                   f"{reachable} market(s)")
             print(f"hold a run deep enough ({need} bars) to warm the trend gate at all.")
             print()
+            print("Trend veto availability by TREND_EMA_LEN: the bar count it needs,"
+                  " and the")
+            print("share of this store's bars a gate of that depth could have judged.")
+            print("Availability, not usefulness — a shorter EMA is also a noisier"
+                  " one:")
+            for length, warm, share in self.store.gate_reachability(
+                    [10, 20, 30, cfg.signal.trend_ema_len]):
+                ship = "  <- shipped" if length == cfg.signal.trend_ema_len else ""
+                print(f"  TREND_EMA_LEN={length:<4d}needs {length + cfg.signal.trend_slope_bars + 1:>3d}"
+                      f" bars{share:>7.1%}  ({warm} of {total_bars} bars){ship}")
+            print()
 
         per_asset: dict[str, dict[str, int]] = {}
         for trade in self.trades:
@@ -413,9 +456,14 @@ class Replay:
                   + ", ".join(f"{k} {v / total:.0%}"
                               for k, v in sorted(self.trends.items(), key=lambda r: -r[1])))
         print()
-        print("Caveats: the replay judges *finished* bars (live signals fire 10s")
-        print("early); the sample is only as long as the bot has been running; and")
+        print("Caveats: the sample is only as long as the bot has been running, and")
         print(f"the store only keeps the last MAX_BARS={cfg.max_bars} bars per market.")
+        if cfg.lead_seconds < cfg.candle_period:
+            print("This run has a short lead, so it judges bars the live loop sees")
+            print("10 seconds early — its win rate is a ceiling, not a prediction.")
+        else:
+            print("The lead is a whole bar, so the window judged here is the one the")
+            print("live loop judges: the entry bar is not read in advance.")
 
 
 def _clock(at: float) -> str:

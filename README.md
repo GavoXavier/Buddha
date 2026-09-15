@@ -187,17 +187,84 @@ engine sees is aggregated here from ticks this process actually received:
 
 The cost is honest warm-up: the fast indicators (RSI, Bollinger, Stochastic) come
 online after ~20 bars, MACD after ~36, the 50-bar trend EMA and the MTF
-confirmation later still — 56 bars before everything is live. The bot **degrades
-gracefully** while it fills in: it signals as soon as `MIN_COMPONENTS`
-directional indicators are warm, and messages you "warming up: 12/56 bars"
-rather than staying silently broken. Raise `MAX_BARS` to hold more history;
-restart warm-up is free once the store has data.
+confirmation later still — 56 bars before everything is live. The **scoring**
+components degrade gracefully while they fill in: the bot signals as soon as
+`MIN_COMPONENTS` directional indicators are warm, and messages you "warming up:
+12/56 bars" rather than staying silently broken. The trend is the exception, and
+it is a large one — see [below](#the-one-component-that-vetoes-is-the-one-that-can-be-missing).
+Raise `MAX_BARS` to hold more history; restart warm-up is free once the store has
+data.
 
 **Warm-up is counted in bars, so it scales with the bar length.** On 5-minute
 bars the first possible signal is 18 bars ≈ **90 minutes** after a cold start, and
 full readiness is 56 bars ≈ **4h40m**. The store is stamped with the period it was
 built at, so changing `CANDLE_PERIOD` discards it and the clock restarts — the
 first signals after a change are not evidence of anything.
+
+### The one component that vetoes is the one that can be missing
+
+Every indicator except the trend *scores*: it votes CALL or PUT and a cold one
+simply does not vote. The trend **vetoes** — a market trending up forbids a PUT
+outright, and that is the whole of its contribution. So a cold trend cannot be
+"degraded gracefully" like the others. Running without it is not a quieter version
+of the same strategy; it is a **different strategy wearing the same name**, with
+the counter-trend filter removed. Measured on the live record: **39 of the 40
+signals the bot had sent** were produced in exactly that state.
+
+So while the veto is unavailable the engine refuses the setup and says so, rather
+than trading a variant nobody configured. It is loud about it in two places —
+`/status` carries a `⏳ waiting on the trend EMA (n)` line, and the log reports
+each passing-over — and every journalled signal records which engine judged it,
+so gated and ungated signals can be told apart after the fact.
+
+**How reachable is it?** The EMA needs `TREND_EMA_LEN + TREND_SLOPE_BARS + 1`
+bars: 50 + 5 + 1 = **56**, which at 300-second bars is 4h40m of *hole-free*
+tracking of one market. Bars cannot be read across a hole — see
+[above](#why-candles-are-built-from-ticks-never-from-history) — so a market that
+leaves the broker's offered set for an hour comes back with its trend EMA at zero.
+Measured over a 5.5-hour session of 21 markets on 2026-09-15:
+
+```
+856 bars, 38 contiguous runs, deepest 67 — and only 3 markets held a run
+deep enough (56 bars) to warm the gate at all. In the replay, 98.9% of the
+setups that reached the engine were never judged, because the veto was cold.
+```
+
+`python backtest.py` prints what that depth costs, over the store it has, so the
+question can be answered from measurement rather than from the settings file:
+
+```
+Trend veto availability by TREND_EMA_LEN: the bar count it needs, and the
+share of this store's bars a gate of that depth could have judged.
+Availability, not usefulness — a shorter EMA is also a noisier one:
+  TREND_EMA_LEN=10  needs  16 bars  46.6%  (406 of 872 bars)
+  TREND_EMA_LEN=20  needs  26 bars  27.4%  (239 of 872 bars)
+  TREND_EMA_LEN=30  needs  36 bars  14.7%  (128 of 872 bars)
+  TREND_EMA_LEN=50  needs  56 bars   3.8%  (33 of 872 bars)  <- shipped
+```
+
+The markets that never churn reach 56 bars about 4h40m into a session and are then
+gated normally; the rest are effectively ungated for as long as they keep
+churning. Only a handful of markets are usually in the first group.
+
+That table is deliberately **availability, not usefulness**. It cannot say whether
+a 20-bar trend reading is a better veto than a 50-bar one, and it does not try —
+it only removes the excuse of not knowing what the current setting costs.
+
+Two honest ways out, and no third one:
+
+- **Run without the veto on purpose.** `USE_TREND=0` is a supported setting, and
+  the bot then says so in `/status` and in each journalled signal, instead of
+  pretending. This is a real strategy choice — it is what the record above was
+  measured on — not a workaround.
+- **Shorten the EMA.** `TREND_EMA_LEN` is what sets reachability: 20 bars needs
+  26, about 2h10m. But a 20-bar EMA is a different and noisier trend reading, and
+  nothing in this project has measured whether the shorter veto is *worth having*.
+  That measurement needs 5-minute history in the store — after a couple of days,
+  `python backtest.py` prints how deep the runs get and what that costs.
+
+Leaving `USE_TREND=1` with an unreachable `TREND_EMA_LEN` is the one state worth
+avoiding, because it looks like a filter is running when nothing is.
 
 ---
 
@@ -310,8 +377,22 @@ Timing is the part that cannot be verified by running the bot for an hour, so th
 scheduler, aggregator and feed all take a `Clock`. Tests drive a `VirtualClock`
 and replay hours of market in milliseconds: the suite covers entry/exit landing
 on bar boundaries, cooldown and circuit-breaker behaviour, an end-to-end
-simulated session, and an assertion that **every signal enters on a minute
-boundary exactly 60 seconds before its expiry**.
+simulated session, and an assertion that **every signal enters on a bar boundary
+exactly one bar before its expiry** — 60s on the original cadence, 300s on the
+shipped one.
+
+Two invariants are pinned end to end rather than unit by unit, because they are
+the ones whose failure is invisible in a running bot:
+
+- **The shipped engine waits for its gate.** No journalled signal may carry a
+  `missing` context naming the trend, and the run must actually have withheld
+  something — otherwise the first assertion could hold for the trivial reason that
+  the gate never came up. The plumbing tests deliberately run `USE_TREND=0` so a
+  path through the engine can be tested at all, and the class that pins the gate
+  uses the shipped settings.
+- **A store file is not a series.** A window that would reach back across a hole
+  is refused, and a candidate whose exit bar is missing is counted rather than
+  settled at a price that is not there.
 
 ## Replay tool
 
@@ -325,10 +406,38 @@ outcome functions the live loop calls, and reports the signal rate plus a
 breakdown of why the other minutes produced nothing. That breakdown is how you
 should choose `MIN_SCORE` rather than guessing.
 
+**A store file is not a series, and the replay stopped pretending otherwise.** The
+store *unions* every session's bars into one file, deliberately — a hole must not
+be able to delete history — so a file legitimately contains several disjoint runs.
+Read as one long series, a window landing on a hole sees an outage as a single
+bar's move, and a market whose feed has stopped gets judged forever afterwards off
+its stale tail. Both are fabrications of the same family as
+[the invented settlement](#telling-a-settlement-from-a-projection), and both were
+fixed with one shared rule: `contiguous_runs()` in `market/aggregator.py` decides
+whether two bars may be read as neighbours, and the live buffer, the restore path
+and the replay all call it, so the three cannot drift apart.
+
+The report now says what it could not read instead of quietly omitting it:
+
+- `runs` / `deepest` per market, and whether the run reaches the 56 bars the trend
+  gate needs (`reachable` / `needs 56`).
+- **`no bar to judge at that moment`** — boundaries with no readable window at
+  all, a share of *market-minutes*. Measured live: 43%.
+- **`trend gate not warm (not judged)`** — setups the engine declined to judge
+  because the veto was cold, a share of *setups*.
+- **`never settled`** — signals whose exit bar is missing from the store, counted
+  rather than invented. A candidate with no exit bar is not a trade, and the replay
+  will not settle one at a price it does not have.
+
 Two caveats it prints for a reason: it judges **finished** bars (a live signal
-fires 10 seconds early on a bar that still has ticks to come), so its win rate is
-a ceiling rather than a prediction; and the sample is only as long as the bot has
-been running. Anything under a few days is a rumour, not a result.
+fires a full bar early on the shipped cadence, so the replay reads the entry bar's
+own close), which makes its win rate a ceiling rather than a prediction; and the
+sample is only as long as the bot has been running. Anything under a few days is a
+rumour, not a result.
+
+The whole store currently spans one session, so the replay's own sample is short
+and its numbers move as the store grows. Read the *structure* — how many runs, how
+deep, how many minutes are unreadable — and wait for the rates.
 
 ## Trading the demo account automatically
 
@@ -392,6 +501,52 @@ exit price — a test that needs no clock, which matters because the broker's
 timestamps are on a different clock from ours (see the offset note below). A
 deal that is still open is left unrecorded and the bot's own bar-close label
 stands, which is honest: it says what we saw, not what we hope was paid.
+
+## Reading the record
+
+`/status` and the periodic log line end with one sentence that is the only honest
+summary of how the bot is doing:
+
+```
+EV -0.114 per trade | 95% CI -0.41..+0.18 | n=36 | 4 never settled | no edge shown yet
+```
+
+Each part is there because leaving it out would let a reader draw a wrong
+conclusion.
+
+**`EV ... per trade` is not a win rate, and a win rate is not enough here.** The
+payout varies by market and by minute, so the same 53% of wins *loses* money at a
+92% payout (break-even 52.1%) and *makes* it at 60% (break-even 62.5%). What each
+trade returned per unit staked is the number that is comparable across all of
+them, and it is signed by the trade's own payout: a win returns `payout/100`, a
+loss returns `-1`, a refund returns `0`.
+
+**`95% CI` is the half that stops the mean from lying.** At 28 settled trades a
+3-point edge is indistinguishable from luck. Printing the average without the
+interval would turn noise into a result, and `no edge shown yet` is what a sample
+that straddles zero is called — not `losing`, and not `promising`.
+
+**`n=36` is smaller than the number of signals sent, for three reasons**, and the
+line names whichever apply rather than making you infer them from a small `n`:
+
+| Clause | What it means |
+|--------|---------------|
+| `N win(s) unpriced` | a win with no payout recorded. Left out rather than guessed at, which can only pull the average *down* |
+| `N unreadable` | the broker's answer was neither a win, a loss nor a refund |
+| `N never settled` | the trade was sent and never settled at all — how it ended is *not known*, as opposed to unreadable |
+
+The first two are settled trades kept out of the average. The third was never in
+it: it is counted as the difference between the signals the journal holds and the
+ones it can account for, so the line cannot drift from the record it was read
+from. Four permanently unsettleable orphans — signals whose bars are no longer on
+disk, so there is no price to settle them at — are the usual source, and the
+startup log names them.
+
+**A signal-only bot grades its own homework.** Every outcome above is read from
+two bar closes this process aggregated from the broker's ticks. That is a
+legitimate measurement of whether price moved as predicted, and it is the only one
+available without placing orders — but it is not the broker's settlement, and
+`reconcile.py` (next section) exists to check the difference.
 
 ## Does our "WIN" mean the same as theirs?
 
@@ -492,6 +647,9 @@ The ones worth knowing first:
 | `MIN_SCORE` | `2` | weighted agreement required |
 | `MIN_COMPONENTS` | `2` | directional indicators that must be warm |
 | `TREND_FLAT_MIN_SCORE` | `3` | evidence demanded in a flat market |
+| `USE_TREND` | `1` | the trend as a veto; `0` runs without it, and says so |
+| `TREND_EMA_LEN` | `50` | bars the trend EMA needs — with `TREND_SLOPE_BARS` this sets how deep a run must be before the veto exists (56) |
+| `MAX_BARS` | `500` | bars kept per market in memory and on disk |
 | `MAX_GAP_BARS` | `5` | feed outage longer than this drops the bars before it |
 | `PERSIST_CANDLES` | `1` | keep bars on disk for a warm restart |
 | `JOURNAL_SIGNALS` | `1` | write the per-trade record `reconcile.py` reads |

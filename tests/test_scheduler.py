@@ -1101,6 +1101,23 @@ class TestTheStatusLineStatesWhatTheRecordIsWorth(SchedulerCase):
         self.assertIn("unpriced", text)
         self.assertNotIn("per trade", text, "nothing priced, so no average")
 
+    def test_a_signal_that_never_settled_is_named_in_the_status(self):
+        # The live case: 4 of 40 signals sit in the journal with a signal line and
+        # no result line, because their bars fell out of the store before they could
+        # be settled. They will never settle now, so the status is the only place a
+        # reader can find out why n is smaller than the number of signals sent.
+        journal = self.journalled(["WIN", "LOSS"])
+        entry_at = BASE + 2 * 60
+        journal.record_signal(asset="BBB_otc", direction="CALL", entry_at=entry_at,
+                              expiry_at=entry_at + 60, payout=92)
+        self.h = Harness(journal=journal)
+        self.addCleanup(self.h.cleanup)
+
+        text = self.h.scheduler.status_text()
+
+        self.assertIn("n=2", text)
+        self.assertIn("1 never settled", text)
+
     def test_a_status_command_survives_a_journal_it_cannot_read(self):
         path = Path(self.h.tmpdir) / "signals.jsonl"
         path.write_text("not json at all\n{}\n", encoding="utf-8")
