@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from market.aggregator import CandleSeries, MarketState
+from market.aggregator import CandleSeries, MarketState, contiguous_runs
 from market.clock import VirtualClock
 from market.store import CandleStore
 from market.universe import (
@@ -319,6 +319,60 @@ class TestCandleSeries(unittest.TestCase):
         self.assertEqual(series.bar_count, 3)
         self.assertEqual([c.time for c in series.closed()],
                          [BASE + 420, BASE + 480, BASE + 540])
+
+
+class TestContiguousRuns(unittest.TestCase):
+    """One rule for "may these two bars be read as neighbours", three callers.
+
+    The live feed, the restore path and the backtester all have to agree about a
+    hole, and they agree by calling this. The store writes additively — a hole
+    must not be able to delete history — so a *file* can hold bars on both sides
+    of an outage that no live series ever held together, which is exactly where a
+    second, subtly different copy of the rule would go unnoticed.
+    """
+
+    PERIOD = 60
+
+    def bars(self, times):
+        return [Candle(float(t), 1.0, 1.0, 1.0, 1.0) for t in times]
+
+    def runs(self, missing_bars, max_gap_bars=5):
+        before = [BASE + i * self.PERIOD for i in range(4)]
+        after = [before[-1] + (missing_bars + 1) * self.PERIOD + i * self.PERIOD
+                 for i in range(3)]
+        return contiguous_runs(self.bars(before + after), self.PERIOD,
+                               max_gap_bars)
+
+    def test_an_unbroken_series_is_one_run(self):
+        self.assertEqual(len(self.runs(missing_bars=0)), 1)
+
+    def test_a_hole_within_the_tolerance_is_still_one_run(self):
+        # A stray missing bar reads as a slightly longer bar, which is noise.
+        self.assertEqual(len(self.runs(missing_bars=5)), 1)
+
+    def test_a_hole_wider_than_the_tolerance_starts_a_new_run(self):
+        runs = self.runs(missing_bars=6)
+        self.assertEqual([len(r) for r in runs], [4, 3])
+
+    def test_the_runs_come_back_oldest_first_whatever_the_order_given(self):
+        shuffled = self.bars([BASE, BASE + 3 * self.PERIOD, BASE + self.PERIOD,
+                              BASE + 2 * self.PERIOD])
+        runs = contiguous_runs(list(reversed(shuffled)), self.PERIOD)
+        self.assertEqual([[c.time for c in run] for run in runs],
+                         [[BASE + i * self.PERIOD for i in range(4)]],
+                         "not sorted, and not reversed, and no empty run after")
+
+    def test_no_bars_is_no_runs(self):
+        self.assertEqual(contiguous_runs([], self.PERIOD), [])
+
+    def test_a_gap_is_counted_in_bars_not_seconds(self):
+        # The same hole is 6 missing bars at a 60s period and 2 at 300s. Getting
+        # this wrong is how a two-hour outage once looked like a blip.
+        long_bars = contiguous_runs(self.bars(
+            [BASE + i * 300 for i in range(4)]
+            + [BASE + (4 + 2) * 300 + i * 300 for i in range(2)]), 300, 5)
+        self.assertEqual(len(long_bars), 1, "2 missing 300s bars is inside the "
+                                            "tolerance of 5")
 
 
 class TestMarketState(unittest.TestCase):

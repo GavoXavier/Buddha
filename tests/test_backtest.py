@@ -162,8 +162,90 @@ class TestReplayPlumbing(BacktestCase):
         for trade in replay.trades:
             self.assertLessEqual(trade["entry_at"], BASE + 3 * PERIOD)
 
+    def test_a_signal_with_no_exit_bar_is_counted_not_invented(self):
+        candles = [bar(BASE + i * PERIOD, 1.0 + i * 0.001) for i in range(6)]
+        del candles[3]                      # the exit bar for the first signal
+        self.write_store({"AAA_otc": candles})
+        replay = self.replay()
 
-class TestFullBarLeadHasNoLookahead(BacktestCase):
+        self.assertGreater(replay.unsettled, 0,
+                           "the live loop would have had no price to settle on "
+                           "either — that is a cost of the store, not a trade")
+        self.assertLess(len(replay.trades), replay.candidates,
+                        "a candidate whose exit bar is missing is not a trade")
+
+    def test_minutes_with_nothing_to_judge_are_counted(self):
+        # BBB_otc stops four bars in; every later boundary has to pass it over.
+        self.write_store({**self.straight("AAA_otc", 8),
+                          **self.straight("BBB_otc", 4)})
+        replay = self.replay()
+
+        self.assertGreater(replay.blind, 0)
+
+
+class TestAStoreFileIsNotASeries(BacktestCase):
+    """A window may not leave its contiguous run, nor end anywhere stale.
+
+    ``CandleStore.save`` unions each session's bars with what is already on disk,
+    so a hole cannot delete history — which means a store *file* holds bars on
+    both sides of an outage that the live buffer never held together, because the
+    aggregator drops the bars before such a hole. A replay that read the file as
+    one series would judge windows the bot cannot have, reading each outage as a
+    single bar's move; and a market whose feed has stopped would go on being
+    judged from its last few bars at every later minute.
+    """
+
+    HOLE = 20           # bars missing between the two runs
+    BEFORE = 6
+
+    def two_runs(self, after=6):
+        first = [bar(BASE + i * PERIOD, 1.0 + i * 0.001)
+                 for i in range(self.BEFORE)]
+        resume = BASE + (self.BEFORE + self.HOLE) * PERIOD
+        second = [bar(resume + i * PERIOD, 2.0 + i * 0.001) for i in range(after)]
+        self.write_store({"AAA_otc": first + second})
+        return resume
+
+    def test_the_file_is_indexed_as_two_runs(self):
+        self.two_runs()
+        store = backtest.Store(self.dir, make_config())
+        self.assertEqual([len(r) for r in store.runs["AAA_otc"]],
+                         [self.BEFORE, 6])
+        self.assertEqual(store.deepest_run(), 6,
+                         "the deepest history on offer is one run, not the file")
+
+    def test_a_window_never_reaches_back_across_the_hole(self):
+        resume = self.two_runs()
+        store = backtest.Store(self.dir, make_config())
+        boundary = int(resume + 2 * PERIOD)
+
+        buffer = store.buffer_for("AAA_otc", boundary)
+
+        self.assertEqual([c.close for c in buffer], [2.0, 2.001],
+                         "only the bars of the run the boundary belongs to")
+        self.assertTrue(all(c.time >= resume for c in buffer))
+
+    def test_a_run_too_short_to_judge_produces_nothing(self):
+        # The resumed run is one bar deep: there is no window to read from it,
+        # even though the file holds twenty-odd bars behind it.
+        self.two_runs(after=1)
+        store = backtest.Store(self.dir, make_config())
+        self.assertEqual(
+            store.buffer_for("AAA_otc", int(BASE + (self.BEFORE + self.HOLE + 1)
+                                           * PERIOD)), [])
+
+    def test_a_market_that_stopped_is_not_judged_after_its_last_bar(self):
+        self.write_store(self.straight(count=6))
+        store = backtest.Store(self.dir, make_config())
+        last = int(BASE + 5 * PERIOD)
+
+        self.assertTrue(store.buffer_for("AAA_otc", last + PERIOD))
+        self.assertEqual(store.buffer_for("AAA_otc", last + 2 * PERIOD), [],
+                         "no bar closes at that moment, so there is nothing to "
+                         "judge — the quiet market must not be re-read forever")
+
+
+class TestReplayPlumbing(BacktestCase):
     """The replay must see what the live loop sees, at either lead.
 
     At a 10-second lead the live aggregator hands the engine a *snapshot* of the

@@ -46,6 +46,36 @@ log = logging.getLogger("pocket.market")
 GAP_TOLERANCE_BARS = 5
 
 
+def contiguous_runs(candles: Sequence[Candle], period: int,
+                    max_gap_bars: int = GAP_TOLERANCE_BARS) -> list[list[Candle]]:
+    """Split a series wherever a hole is too wide for one series to span it.
+
+    This is the rule that decides whether two bars may be read as neighbours, and
+    it is deliberately one function rather than three copies of it. Three places
+    need the same answer: ``_note_gap`` applies it to a live feed,
+    ``restore`` applies it to persisted bars, and ``backtest`` has to apply it
+    when it reads a store file — because a *file* is not a series. ``save``
+    unions each session's bars with what is already on disk so a hole cannot
+    delete history, so a store file routinely holds bars on both sides of an
+    outage that no live series ever held together. A replay that ignored that
+    would judge windows the bot could never have had, reading each outage as one
+    bar's move — the exact failure this rule exists to prevent.
+
+    Returns the runs oldest first, as lists of bars. The input need not be
+    sorted; bars at the same timestamp stay together in one run.
+    """
+    runs: list[list[Candle]] = []
+    for candle in sorted(candles, key=lambda c: c.time):
+        if runs:
+            missing = int(round((candle.time - runs[-1][-1].time) / period)) - 1
+            if missing > max_gap_bars:
+                runs.append([])
+        else:
+            runs.append([])
+        runs[-1].append(candle)
+    return runs
+
+
 class CandleSeries:
     """Rolling tick-built candle series for one symbol."""
 
@@ -257,25 +287,20 @@ class CandleSeries:
         session that does have a contiguous run through them can still use them.
         """
         ordered = sorted(candles, key=lambda x: x.time)[-self.max_bars:]
-        start = self._newest_contiguous_start(ordered)
-        if start:
-            missing = int(round((ordered[start].time - ordered[start - 1].time)
+        runs = contiguous_runs(ordered, self.period, self.max_gap_bars)
+        if not runs:
+            return
+        if len(runs) > 1:
+            # Report the newest hole only: it is the one that decides how much
+            # of the persisted history this session is able to read.
+            missing = int(round((runs[-1][0].time - runs[-2][-1].time)
                                 / self.period)) - 1
             log.warning("%s: persisted bars span %d missing bar(s) (%.0f min at "
                         "%ds bars) — restored only the %d bar(s) after it",
                         self.symbol, missing, self._minutes(missing),
-                        self.period, len(ordered) - start)
-        for c in ordered[start:]:
+                        self.period, len(runs[-1]))
+        for c in runs[-1]:
             self._closed.append(c)
-
-    def _newest_contiguous_start(self, candles: Sequence[Candle]) -> int:
-        """Index of the first bar in the newest unbroken run, 0 if none is broken."""
-        start = 0
-        for i in range(1, len(candles)):
-            gap = (candles[i].time - candles[i - 1].time) / self.period
-            if int(round(gap)) - 1 > self.max_gap_bars:
-                start = i
-        return start
 
 
 class MarketState:

@@ -29,6 +29,19 @@ backtest sees slightly more information than the bot does, and its win rate is a
 ceiling rather than a prediction. Signals also carry no payout here (the store
 does not record one), so ranking ties fall through to the symbol name.
 
+**What a store file is not.** It is not a series. ``CandleStore.save`` is
+additive — a hole may not delete history, so each session's bars are unioned with
+the file — which means a file routinely holds bars on *both sides* of an outage
+that no live series ever held together. The live buffer refuses to read across
+such a hole (``CandleSeries._note_gap``) and so does the restore path, so a
+replay that read the file as one long series would judge windows the bot could
+never have had, reading each outage as a single bar's move. This replay
+therefore splits every market into ``contiguous_runs`` — the same function the
+aggregator itself uses — and refuses a window that leaves its run, and refuses
+one whose newest bar is not the bar that closed at the moment the signal would
+have gone out (a market that stopped ticking must not go on being judged from
+its stale tail at every later minute).
+
 **Sample size.** The store only holds what the bot has watched — an hour of
 uptime is an hour of sample. Treat anything under a few days as a rumour.
 """
@@ -46,6 +59,7 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 
 from config import Config, ConfigError, load_config
 from engine.scheduler import outcome_of
+from market.aggregator import contiguous_runs
 from market.store import CandleStore
 from signals.engine import Candle, _analyze, evaluate, vote_components
 from signals.ranking import Candidate, select_best
@@ -69,14 +83,25 @@ class Store:
                                  feed=cfg.feed)
         self.bars: dict[str, list[Candle]] = {}
         self.times: dict[str, list[float]] = {}
+        # For each bar, the index of the first bar of the run it belongs to. A
+        # window may never reach back past it (see ``buffer_for``).
+        self.run_start: dict[str, list[int]] = {}
+        self.runs: dict[str, list[list[Candle]]] = {}
         for symbol in self._symbols(directory):
             candles = self.store.load(symbol)
             if hours > 0 and candles:
                 cutoff = candles[-1].time - hours * 3600
                 candles = [c for c in candles if c.time >= cutoff]
-            if len(candles) >= 2:
-                self.bars[symbol] = candles
-                self.times[symbol] = [c.time for c in candles]
+            if len(candles) < 2:
+                continue
+            runs = contiguous_runs(candles, cfg.candle_period, cfg.max_gap_bars)
+            self.bars[symbol] = candles
+            self.times[symbol] = [c.time for c in candles]
+            self.runs[symbol] = runs
+            starts: list[int] = []
+            for run in runs:
+                starts.extend([len(starts)] * len(run))
+            self.run_start[symbol] = starts
 
     @staticmethod
     def _symbols(directory: str | Path) -> list[str]:
@@ -122,14 +147,41 @@ class Store:
         whole bar of hindsight: the replay would judge on the very bar the trade
         opens on and report an edge the live loop cannot have. There the window
         stops one bar earlier, matching the live ``series.closed()``.
+
+        Two things a window may not do, both of which it used to:
+
+        * **Leave its run.** The live series holds no bars from the far side of a
+          hole wider than ``MAX_GAP_BARS``, so a window spanning one is a market
+          state that never existed — the outage gets read as a single bar's move
+          and the indicators vote off it.
+        * **End anywhere but on the bar that closed at the signal.** The newest
+          bar must open exactly at ``boundary - bars_back``. Without that check a
+          market whose feed stopped went on being judged from its last few bars
+          at *every* later boundary, manufacturing setups out of a market that
+          had gone quiet — which is the opposite of what the live loop does, and
+          it flatters whichever market was quietest.
         """
         candles, times = self.bars[symbol], self.times[symbol]
         period = self.cfg.candle_period
         bars_back = period if self.cfg.lead_seconds < period else 2 * period
-        i = bisect_right(times, boundary - bars_back)
-        if i < 2:
+        anchor = boundary - bars_back
+        i = bisect_right(times, anchor)
+        if i < 2 or abs(times[i - 1] - anchor) > 1e-6:
             return []
-        return candles[max(0, i - self.cfg.max_bars):i]
+        start = max(self.run_start[symbol][i - 1], i - self.cfg.max_bars)
+        if i - start < 2:
+            return []
+        return candles[start:i]
+
+    def deepest_run(self) -> int:
+        """Bars in the longest contiguous run any market offers.
+
+        The ceiling on every indicator: a window cannot be longer than the run
+        it is read from, so this is the honest answer to "how warm can this store
+        possibly make the engine".
+        """
+        return max((len(run) for runs in self.runs.values() for run in runs),
+                   default=0)
 
 
 class Replay:
@@ -144,6 +196,16 @@ class Replay:
         self.judgements = 0
         self.candidates = 0
         self.boundaries = 0
+        # Markets with nothing legitimate to judge at that boundary: no bar
+        # closing at the signal moment, or a run too short to read a window from.
+        self.blind = 0
+        # Signals whose entry or exit bar is not in the store, so the live loop
+        # would have had no price to settle on. Counted rather than dropped
+        # silently, since it is a real cost of a fragmented store.
+        self.unsettled = 0
+        # Setups the engine produced but the loop will not judge: their trend
+        # EMA is short of TREND_EMA_LEN + TREND_SLOPE_BARS + 1 bars.
+        self.cold_gate = 0
         self.scores: dict[int, int] = {}
         self.trends: dict[str, int] = {}
 
@@ -167,15 +229,31 @@ class Replay:
         for symbol in self.store.bars:
             buffer = self.store.buffer_for(symbol, boundary)
             if len(buffer) < 2:
+                self.blind += 1
                 continue
             self.judgements += 1
             signal = evaluate(buffer, self.cfg.signal)
-            if signal is not None:
-                self.scores[signal.score] = self.scores.get(signal.score, 0) + 1
-                out.append(Candidate(asset=symbol, signal=signal, bars=len(buffer)))
+            if signal is None:
+                self._blame(buffer)
                 continue
-            self._blame(buffer)
+            if not self._gates_warm(signal):
+                continue
+            self.scores[signal.score] = self.scores.get(signal.score, 0) + 1
+            out.append(Candidate(asset=symbol, signal=signal, bars=len(buffer)))
         return out
+
+    def _gates_warm(self, signal) -> bool:
+        """Whether the live loop would have judged this setup at all.
+
+        The live ``_collect`` refuses a setup whose trend EMA is still warming,
+        because the trend is a veto and an absent veto makes it a different
+        strategy. Replaying those anyway would measure a variant that cannot be
+        traded, so they are counted and dropped here too.
+        """
+        if "trend" not in signal.missing:
+            return True
+        self.cold_gate += 1
+        return False
 
     def _blame(self, buffer: list[Candle]) -> None:
         """Classify a rejection without re-implementing the gates.
@@ -203,7 +281,11 @@ class Replay:
         exit_price = self.store.close_at(
             chosen.asset, boundary - period + cfg.expiry_seconds)
         if entry_price is None or exit_price is None:
-            return  # a gap in the store: the live loop would wait for the tick
+            # A hole where the entry or the exit bar should be. The live loop
+            # would have had no tick to settle on either, so this is not a
+            # missed trade but a trade that could not have been run.
+            self.unsettled += 1
+            return
         self.trades.append({
             "asset": chosen.asset,
             "direction": chosen.signal.direction,
@@ -247,17 +329,36 @@ class Replay:
             return
 
         hours = self.hours()
-        print(f"{'market':<16}{'bars':>7}  {'from':<12}{'to':<12}{'span':>6}")
-        print("-" * 55)
+        # The depth that matters is the longest *run*, not the number of bars on
+        # file: a window may not cross a hole, so a market with 200 stored bars
+        # in six runs offers six shallow histories, not one deep one.
+        need = self.store.cfg.signal.trend_ema_len + \
+            self.store.cfg.signal.trend_slope_bars + 1
+        print(f"{'market':<16}{'bars':>6}{'runs':>6}{'deepest':>9}  "
+              f"{'oldest':<12}{'newest':<12}trend gate")
+        print("-" * 68)
+        reachable = 0
         for symbol, candles in sorted(self.store.bars.items()):
-            span = (candles[-1].time - candles[0].time) / 3600.0
-            print(f"{symbol:<16}{len(candles):>7}  {_clock(candles[0].time):<12}"
-                  f"{_clock(candles[-1].time):<12}{span:>5.1f}h")
+            runs = self.store.runs[symbol]
+            deepest = max(len(r) for r in runs)
+            if deepest >= need:
+                reachable += 1
+            print(f"{symbol:<16}{len(candles):>6}{len(runs):>6}{deepest:>9}  "
+                  f"{_clock(candles[0].time):<12}{_clock(candles[-1].time):<12}"
+                  f"{'reachable' if deepest >= need else f'needs {need}'}")
         total_bars = sum(len(c) for c in self.store.bars.values())
-        print("-" * 55)
-        print(f"{'':<16}{total_bars:>7}  over {hours:.1f}h across "
-              f"{len(self.store.bars)} markets")
+        total_runs = sum(len(r) for r in self.store.runs.values())
+        print("-" * 68)
+        print(f"{'':<16}{total_bars:>6}{total_runs:>6}{self.store.deepest_run():>9}"
+              f"  over {hours:.1f}h across {len(self.store.bars)} markets")
         print()
+        if total_runs > len(self.store.bars):
+            print(f"{total_runs} contiguous runs over {len(self.store.bars)} markets: "
+                  f"a hole wider than MAX_GAP_BARS ({self.store.cfg.max_gap_bars} bars)")
+            print("starts a new one, and no window may be read across it. Only "
+                  f"{reachable} market(s)")
+            print(f"hold a run deep enough ({need} bars) to warm the trend gate at all.")
+            print()
 
         per_asset: dict[str, dict[str, int]] = {}
         for trade in self.trades:
@@ -292,6 +393,17 @@ class Replay:
                 print(f"  {reason:<34}{count:>7}  {count / total:>6.1%}")
         else:
             print("  (nothing was rejected)")
+        if self.cold_gate:
+            share = self.cold_gate / max(1, self.cold_gate + self.candidates)
+            print(f"  {'trend gate not warm (not judged)':<34}{self.cold_gate:>7}  "
+                  f"{share:>6.1%}  of setups")
+        if self.blind:
+            print(f"  {'no bar to judge at that moment':<34}{self.blind:>7}  "
+                  f"{self.blind / max(1, self.blind + self.judgements):>6.1%}  "
+                  f"of market-minutes")
+        if self.unsettled:
+            print(f"  {'signal had no entry/exit bar':<34}{self.unsettled:>7}  "
+                  f"not settled, not invented")
         if self.scores:
             print("Score distribution of accepted setups: "
                   + ", ".join(f"{k}:{v}" for k, v in sorted(self.scores.items())))
