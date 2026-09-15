@@ -11,8 +11,8 @@ import unittest
 from pathlib import Path
 
 from journal import (
-    KIND_RESULT, KIND_SIGNAL, SCHEMA_VERSION, SignalJournal, JournalledTrade,
-    load_journal, signal_id,
+    KIND_RESULT, KIND_SIGNAL, SCHEMA_VERSION, ExpectedValue, SignalJournal,
+    JournalledTrade, LoadedJournal, format_ev, load_journal, signal_id,
 )
 
 BASE = 1_700_000_040.0
@@ -337,6 +337,184 @@ class TestTheBrokerSide(JournalCase):
 
         self.assertAlmostEqual(trade.broker_entry, 1.0844)
         self.assertAlmostEqual(trade.broker_profit, 0.85)
+
+
+class TestWhatTheRecordIsWorth(unittest.TestCase):
+    """The per-trade return, and the interval that says how little is known.
+
+    A win rate cannot be read on its own here, because the payout is not fixed:
+    the same 53% of wins loses money at a 92% payout (break-even 52.1%) and
+    makes it at 60% (break-even 62.5%). These tests are about the number that
+    *is* readable, and about the sample sizes at which it starts to mean
+    anything.
+    """
+
+    def trade(self, outcome, payout=0, broker_payout=None, **overrides):
+        values = dict(asset="EURUSD_otc", direction="CALL", entry_at=BASE,
+                      expiry_at=BASE + 60, payout=payout, our_outcome=outcome)
+        if broker_payout is not None:
+            # The money's own answer, which is the outcome of record.
+            values["broker_outcome"] = outcome
+            values["broker_payout"] = broker_payout
+        values.update(overrides)
+        return JournalledTrade(**values)
+
+    def sample(self, wins, losses, payout=92, pushes=0):
+        """A loaded journal of ``wins``/``losses``/``pushes`` at one payout."""
+        trades = [self.trade("WIN", payout) for _ in range(wins)]
+        trades += [self.trade("LOSS", payout) for _ in range(losses)]
+        trades += [self.trade("PUSH", payout) for _ in range(pushes)]
+        return LoadedJournal(trades=trades)
+
+    def test_a_win_pays_its_payout_and_a_loss_takes_the_stake(self):
+        ev = self.sample(wins=1, losses=1).expected_value()
+
+        self.assertEqual(ev.n, 2)
+        self.assertAlmostEqual(ev.mean, (0.92 - 1.0) / 2)
+
+    def test_a_refund_returns_the_stake_untouched(self):
+        ev = self.sample(wins=1, losses=1, pushes=1).expected_value()
+
+        self.assertEqual(ev.n, 3, "a refund is a data point at zero, not a gap")
+        self.assertAlmostEqual(ev.mean, (0.92 - 1.0 + 0.0) / 3)
+
+    def test_the_broker_s_payout_is_the_one_that_paid(self):
+        # Quoted 60% at signal time, settled at 92%: the money is what happened.
+        loaded = LoadedJournal(trades=[self.trade("WIN", 60, broker_payout=92.0)])
+
+        self.assertAlmostEqual(loaded.expected_value().mean, 0.92)
+
+    def test_a_loss_needs_no_payout_because_its_return_does_not_depend_on_one(self):
+        loaded = LoadedJournal(trades=[self.trade("LOSS", payout=0)])
+
+        self.assertEqual(loaded.expected_value().n, 1)
+        self.assertAlmostEqual(loaded.expected_value().mean, -1.0)
+
+    def test_a_win_with_no_payout_is_left_out_and_counted(self):
+        # Guessing a payout for it would invent the number the whole figure
+        # rests on; leaving it out can only pull the average down, never up.
+        loaded = LoadedJournal(trades=[self.trade("WIN", payout=0),
+                                       self.trade("LOSS", payout=92)])
+
+        ev = loaded.expected_value()
+
+        self.assertEqual(ev.n, 1, "only the loss is priced")
+        self.assertAlmostEqual(ev.mean, -1.0)
+        self.assertEqual(ev.unpriced, 1)
+        self.assertEqual(ev.excluded, 1)
+
+    def test_a_settlement_that_is_neither_is_left_out_and_counted(self):
+        loaded = LoadedJournal(trades=[self.trade("UNKNOWN", payout=92),
+                                       self.trade("WIN", payout=92)])
+
+        ev = loaded.expected_value()
+
+        self.assertEqual(ev.n, 1)
+        self.assertEqual(ev.unjudged, 1)
+        self.assertEqual(ev.unpriced, 0, "an unreadable answer is not an unpriced win")
+
+    def test_an_unsettled_signal_is_not_a_trade(self):
+        loaded = LoadedJournal(trades=[self.trade(None, payout=92)])
+
+        ev = loaded.expected_value()
+
+        self.assertEqual(ev.n, 0)
+        self.assertEqual(ev.excluded, 0, "never settled is not the same as dropped")
+
+    def test_a_majority_of_wins_can_still_be_a_losing_record(self):
+        # The whole reason this exists: 52% reads like a winning record and is
+        # a hair under break-even at a 92% payout.
+        loaded = self.sample(wins=52, losses=48, payout=92)
+
+        self.assertGreater(loaded.our_win_rate(), 0.5)
+        self.assertLess(loaded.expected_value().mean, 0.0)
+
+    def test_the_interval_narrows_as_the_sample_grows(self):
+        small = self.sample(wins=5, losses=5, payout=60).expected_value()
+        large = self.sample(wins=500, losses=500, payout=60).expected_value()
+
+        self.assertAlmostEqual(small.mean, large.mean, places=6)
+        self.assertLess(large.high - large.low, small.high - small.low)
+
+    def test_a_losing_sample_clears_zero_on_the_other_side(self):
+        ev = self.sample(wins=550, losses=450, payout=60).expected_value()
+
+        self.assertLess(ev.high, 0.0)
+        self.assertEqual(ev.verdict, "under break-even")
+
+    def test_a_sample_that_straddles_break_even_says_so(self):
+        ev = self.sample(wins=52, losses=48, payout=92).expected_value()
+
+        self.assertLess(ev.low, 0.0)
+        self.assertGreater(ev.high, 0.0)
+        self.assertEqual(ev.verdict, "no edge shown yet")
+
+    def test_one_trade_has_no_interval_to_report(self):
+        ev = self.sample(wins=1, losses=0, payout=92).expected_value()
+
+        self.assertEqual(ev.n, 1)
+        self.assertIsNone(ev.low, "one point has no spread")
+        self.assertIsNone(ev.high)
+        self.assertEqual(ev.verdict, "too few to judge")
+
+    def test_nothing_to_report_renders_as_nothing(self):
+        self.assertEqual(format_ev(ExpectedValue()), "")
+        self.assertEqual(format_ev(LoadedJournal().expected_value()), "")
+
+    def test_the_line_carries_the_mean_the_interval_and_the_count(self):
+        small = format_ev(self.sample(wins=5, losses=5, payout=60).expected_value())
+
+        self.assertIn("EV -0.200 per trade", small)
+        self.assertIn("95% CI", small)
+        self.assertIn("n=10", small)
+        self.assertIn("no edge shown yet", small)
+        self.assertNotIn("<", small, "this goes into an HTML message unescaped")
+        self.assertNotIn(">", small)
+
+    def test_the_line_is_ascii_so_the_log_can_hold_it(self):
+        # The startup line goes through logging to a stream Windows opens in the
+        # locale codepage: one emoji and the whole line is dropped, not mangled.
+        line = format_ev(self.sample(wins=3, losses=2, payout=92).expected_value())
+
+        line.encode("ascii")
+
+    def test_the_line_names_what_it_left_out(self):
+        loaded = LoadedJournal(trades=[self.trade("WIN", payout=0),
+                                       self.trade("LOSS", payout=92),
+                                       self.trade("UNKNOWN", payout=92)])
+        line = format_ev(loaded.expected_value())
+
+        self.assertIn("1 win(s) unpriced", line)
+        self.assertIn("1 unreadable", line)
+
+    def test_nothing_priced_but_something_dropped_says_why(self):
+        # The failure this guards: an unpriced win silently vanishing reads as
+        # "no trades yet", when in fact there was a trade and its payout is gone.
+        loaded = LoadedJournal(trades=[self.trade("WIN", payout=0)])
+
+        line = format_ev(loaded.expected_value())
+
+        self.assertEqual(line, "EV unknown | 1 win(s) unpriced")
+
+    def test_the_report_is_built_from_a_file_the_bot_wrote(self):
+        # End to end: a signal and its result, through the writer and the reader.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        path = Path(self.tmp.name) / "signals.jsonl"
+        journal = SignalJournal(path)
+        for i, outcome in enumerate(("WIN", "LOSS")):
+            entry_at = BASE + i * 60
+            journal.record_signal(asset="EURUSD_otc", direction="CALL",
+                                  entry_at=entry_at, expiry_at=entry_at + 60,
+                                  payout=92)
+            journal.record_result(asset="EURUSD_otc", entry_at=entry_at,
+                                  outcome=outcome, entry_price=1.0, exit_price=1.1)
+
+        ev = load_journal(path).expected_value()
+
+        self.assertEqual(ev.n, 2)
+        self.assertAlmostEqual(ev.mean, -0.04)
+        self.assertIn("n=2", format_ev(ev))
 
 
 if __name__ == "__main__":

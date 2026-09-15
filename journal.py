@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field as dc_field
@@ -267,6 +268,55 @@ class LoadedJournal:
                 agreed += 1
         return agreed, compared
 
+    # -- what the record is worth --------------------------------------------
+    def expected_value(self) -> "ExpectedValue":
+        """The per-trade return, with the uncertainty that is honestly attached.
+
+        A win rate cannot be read on its own here, because the payout is not
+        fixed: 53% of trades won is a losing record at a 92% payout (break-even
+        is 52.1%) and a comfortable one at 60% (break-even 62.5%). The number
+        that *is* comparable across trades is what each one returned per unit
+        staked, so that is the one computed — and averaged.
+
+        The interval matters as much as the mean. A handful of trades cannot
+        establish a small edge: at 28 settled trades a 2.9-point edge is
+        indistinguishable from luck. Reporting the mean without it would turn
+        noise into a result, which is the failure mode this whole file exists to
+        avoid.
+
+        Only settled trades count, and the arithmetic assumes a flat stake —
+        which is what the bot places. A winning trade with no payout on record
+        is left out rather than guessed at; that can only pull the average
+        *down*, never up, since the missing returns are positive ones.
+        """
+        returns: list[float] = []
+        unpriced = unjudged = 0
+        for trade in self.settled:
+            value = trade_return(trade)
+            if value is None:
+                if trade.outcome_of_record == "WIN":
+                    unpriced += 1
+                else:
+                    unjudged += 1
+                continue
+            returns.append(value)
+
+        n = len(returns)
+        if not n:
+            return ExpectedValue(unpriced=unpriced, unjudged=unjudged)
+        mean = sum(returns) / n
+        if n < 2:
+            # One trade has no spread to estimate, so there is no interval to
+            # print — only the number itself.
+            return ExpectedValue(n=n, mean=mean, unpriced=unpriced,
+                                 unjudged=unjudged)
+        variance = sum((r - mean) ** 2 for r in returns) / (n - 1)
+        stdev = math.sqrt(variance)
+        half = Z_95 * stdev / math.sqrt(n)
+        return ExpectedValue(n=n, mean=mean, stdev=stdev, low=mean - half,
+                             high=mean + half, unpriced=unpriced,
+                             unjudged=unjudged)
+
     def between(self, start: float, end: float) -> "LoadedJournal":
         """Only the signals entered in ``[start, end]`` — the reconcile window."""
         kept = [t for t in self.trades if start <= t.entry_at <= end]
@@ -278,6 +328,100 @@ class LoadedJournal:
 
     def __len__(self) -> int:
         return len(self.trades)
+
+
+# The z for a two-sided 95% interval — the ordinary convention, named so the
+# arithmetic below is not a magic number.
+Z_95 = 1.96
+
+
+@dataclass(frozen=True)
+class ExpectedValue:
+    """What the record returned per trade, and how well that is known."""
+
+    n: int = 0
+    mean: float = 0.0
+    stdev: float = 0.0
+    # Absent when there is one trade or none: a spread needs two points.
+    low: Optional[float] = None
+    high: Optional[float] = None
+    # Settled trades kept out of the average, and why: a win whose payout was
+    # never recorded, and a settlement that was neither a win, a loss nor a
+    # refund (the broker's answer could not be read).
+    unpriced: int = 0
+    unjudged: int = 0
+
+    @property
+    def excluded(self) -> int:
+        return self.unpriced + self.unjudged
+
+    @property
+    def verdict(self) -> str:
+        """The one-line reading: does the interval clear break-even?"""
+        if self.low is None:
+            return "too few to judge"
+        if self.low > 0:
+            return "beats break-even"
+        if self.high < 0:
+            return "under break-even"
+        return "no edge shown yet"
+
+
+def trade_return(trade: JournalledTrade) -> Optional[float]:
+    """What one settled trade returned per unit staked, or None if unknowable.
+
+    A win pays the payout the trade was actually on — the broker's own number
+    when the bot placed the order, the quote from signal time otherwise. A loss
+    takes the stake, which is true whatever the payout was, so a loss is never
+    unknowable. A refund returns it untouched.
+    """
+    outcome = trade.outcome_of_record
+    if outcome == "PUSH":
+        return 0.0
+    if outcome == "LOSS":
+        return -1.0
+    if outcome != "WIN":
+        return None
+    payout = trade.broker_payout or trade.payout
+    if payout <= 0:
+        return None
+    return payout / 100.0
+
+
+def format_ev(ev: ExpectedValue) -> str:
+    """The facts, as one line for the log and for Telegram. "" if none.
+
+    Plain ASCII, on purpose, and that is not a style choice: the startup line
+    goes through ``logging`` to a stream Windows opens in the locale codepage,
+    where an emoji does not encode and the whole line is lost rather than
+    mangled. Callers that want a symbol in a Telegram message add their own.
+
+    Also free of ``<`` and ``>``: the status message is otherwise hand-written
+    HTML, and an interval written as ``-0.2..+0.1`` needs no escaping.
+    """
+    dropped = _exclusions(ev)
+    if not ev.n:
+        # Nothing priced. If trades were left out, name them: that is why there
+        # is no number, and a silent drop would read as an empty record.
+        return f"EV unknown | {dropped}" if dropped else ""
+    if ev.low is None:
+        text = f"EV {ev.mean:+.3f} per trade | n={ev.n}"
+    else:
+        text = (f"EV {ev.mean:+.3f} per trade | 95% CI "
+                f"{ev.low:+.2f}..{ev.high:+.2f} | n={ev.n}")
+    if dropped:
+        text += f" | {dropped}"
+    return f"{text} | {ev.verdict}"
+
+
+def _exclusions(ev: ExpectedValue) -> str:
+    """The trades kept out of the average, and what stopped them counting."""
+    parts = []
+    if ev.unpriced:
+        parts.append(f"{ev.unpriced} win(s) unpriced")
+    if ev.unjudged:
+        parts.append(f"{ev.unjudged} unreadable")
+    return ", ".join(parts)
 
 
 def load_journal(path: str | os.PathLike[str]) -> LoadedJournal:

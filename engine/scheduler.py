@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 from execution import UNPLACED, DemoBroker, Order
-from journal import SignalJournal, load_journal
+from journal import SignalJournal, format_ev, load_journal
 from market.aggregator import MarketState
 from market.clock import Clock, RealClock
 from signals.engine import Candle, Readiness, SignalConfig, evaluate, readiness
@@ -318,11 +318,34 @@ class MinuteScheduler:
             note = f" (paused {int((self._paused_until - now) / 60) + 1} min)"
         else:
             note = ""
-        return format_status(
+        lines = [format_status(
             running=not self.controller.paused and not note,
             assets=len(self.symbols), healthy=len(healthy), bars=bars,
             bars_needed=max(r.bars_needed, 1), next_entry_at=self.next_entry_at,
-            now=now) + note
+            now=now) + note]
+        # What the record is worth, next to the state of the bot. Read from the
+        # journal on the spot rather than cached: this runs on a typed command,
+        # not in the loop, and a stale EV is the one number that must not be.
+        record = self.expected_value_text()
+        if record:
+            lines.append(f"📈 {record}")
+        return "\n".join(lines)
+
+    def expected_value_text(self) -> str:
+        """The per-trade return and its interval, or "" when there is no record.
+
+        A read failure is not worth an exception on a status command — the bot
+        is fine, only the reporting is.
+        """
+        if self.journal is None:
+            return ""
+        try:
+            loaded = load_journal(self.journal.path)
+        except OSError as exc:
+            log.warning("could not read %s for the record: %s",
+                        self.journal.path, exc)
+            return ""
+        return format_ev(loaded.expected_value())
 
     # -- internals -----------------------------------------------------------
     def _blocked(self, now: float) -> bool:

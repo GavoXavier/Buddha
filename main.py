@@ -38,7 +38,7 @@ from data import DataFeed, SimulatedFeed
 from data.pocket_option import PocketOptionFeed
 from engine.scheduler import MinuteScheduler
 from execution import DemoBroker
-from journal import SignalJournal
+from journal import SignalJournal, format_ev, load_journal
 from market.aggregator import MarketState
 from market.clock import Clock, RealClock
 from market.store import CandleStore
@@ -417,6 +417,17 @@ async def run(cfg: Config) -> None:
     if stats.legacy.total:
         log.info("plus %dW/%dL held over from %s, kept out of that figure",
                  stats.legacy.wins, stats.legacy.losses, cfg.legacy_stats_path)
+    # The win rate above is context, not a result: with the payout varying from
+    # market to market, and from session to session, it cannot be read on its
+    # own. This is the number that can.
+    try:
+        record = format_ev(load_journal(cfg.signal_journal_path).expected_value())
+    except OSError as exc:
+        record = ""
+        log.warning("could not read %s for the record: %s",
+                    cfg.signal_journal_path, exc)
+    if record:
+        log.info("%s", record)
 
     controller = BotController()
     status_holder: dict = {"scheduler": None}

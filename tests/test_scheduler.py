@@ -77,7 +77,7 @@ class Harness:
     """
 
     def __init__(self, direction="CALL", cadence=None, symbols=("AAA_otc",),
-                 config=None, payouts=None, min_payout=0):
+                 config=None, payouts=None, min_payout=0, journal=None):
         self.cadence = cadence or Cadence()
         self.period = self.cadence.period
         self.vc = VirtualClock(start=BASE)
@@ -95,7 +95,12 @@ class Harness:
             controller=self.controller, cadence=self.cadence,
             engine_config=config or SignalConfig(), symbols=self.symbols,
             payouts={s: 85 for s in self.symbols} if payouts is None else payouts,
-            min_payout=min_payout, clock=self.vc)
+            min_payout=min_payout, clock=self.vc, journal=journal)
+
+    @property
+    def tmpdir(self) -> Path:
+        """The scratch directory this harness cleans up with itself."""
+        return Path(self._tmp.name)
 
     def feed(self, end, close, high=None, low=None):
         """Replay the bar that *ends* at ``end`` (opens ``end - period``).
@@ -808,6 +813,74 @@ class TestThePayoutFloorIsEnforcedAtTheSignal(unittest.TestCase):
                         f"bars — and was passed over: {caught.output}")
         self.assertEqual(h.sender.signals, [], "and was still not traded")
         self.assertEqual(h.scheduler.open_trades, [])
+
+
+class TestTheStatusLineStatesWhatTheRecordIsWorth(SchedulerCase):
+    """/status shows the bot's state; it has to show the result too.
+
+    A win rate alone cannot be judged when the payout moves — so the status
+    carries the per-trade return and its interval, read from the journal at the
+    moment the command is typed.
+    """
+
+    def journalled(self, outcomes, payout=92):
+        """A journal file on disk, as the bot writes it: one signal, one result."""
+        path = Path(self.h.tmpdir) / "signals.jsonl"
+        journal = SignalJournal(path)
+        for i, outcome in enumerate(outcomes):
+            entry_at = BASE + i * 60
+            journal.record_signal(asset="AAA_otc", direction="CALL",
+                                  entry_at=entry_at, expiry_at=entry_at + 60,
+                                  payout=payout)
+            journal.record_result(asset="AAA_otc", entry_at=entry_at,
+                                  outcome=outcome, entry_price=1.0, exit_price=1.1)
+        return journal
+
+    def test_the_status_carries_the_return_per_trade(self):
+        journal = self.journalled(["WIN", "LOSS", "LOSS"])
+        self.h = Harness(journal=journal)
+        self.addCleanup(self.h.cleanup)
+
+        text = self.h.scheduler.status_text()
+
+        self.assertIn("Status", text, "the state of the bot is still there")
+        self.assertIn("EV", text)
+        self.assertIn("n=3", text)
+        self.assertIn("-0.360 per trade", text, "(0.92 - 1 - 1) / 3")
+
+    def test_a_win_with_no_payout_on_record_is_named_not_guessed(self):
+        # Written the way an older build did, before the payout was journalled.
+        path = Path(self.h.tmpdir) / "signals.jsonl"
+        journal = SignalJournal(path)
+        entry_at = BASE
+        journal.record_signal(asset="AAA_otc", direction="CALL", entry_at=entry_at,
+                              expiry_at=entry_at + 60)
+        journal.record_result(asset="AAA_otc", entry_at=entry_at, outcome="WIN",
+                              entry_price=1.0, exit_price=1.1)
+        self.h = Harness(journal=journal)
+        self.addCleanup(self.h.cleanup)
+
+        text = self.h.scheduler.status_text()
+
+        self.assertIn("unpriced", text)
+        self.assertNotIn("per trade", text, "nothing priced, so no average")
+
+    def test_a_status_command_survives_a_journal_it_cannot_read(self):
+        path = Path(self.h.tmpdir) / "signals.jsonl"
+        path.write_text("not json at all\n{}\n", encoding="utf-8")
+        self.h = Harness(journal=SignalJournal(path))
+        self.addCleanup(self.h.cleanup)
+
+        text = self.h.scheduler.status_text()
+
+        self.assertIn("Status", text)
+        self.assertNotIn("EV", text)
+
+    def test_no_journal_means_no_record_line(self):
+        self.h = Harness()
+        self.addCleanup(self.h.cleanup)
+
+        self.assertNotIn("EV", self.h.scheduler.status_text())
 
 
 if __name__ == "__main__":
