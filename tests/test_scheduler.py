@@ -26,7 +26,7 @@ from engine.scheduler import (
 from journal import SignalJournal, load_journal
 from market.aggregator import MarketState
 from market.clock import VirtualClock
-from signals.engine import Signal, SignalConfig
+from signals.engine import Readiness, Signal, SignalConfig
 from signals.ranking import Candidate, eligible
 from stats import StatsTracker
 from telegram.control import BotController
@@ -686,6 +686,32 @@ class TestASetupJudgedWithAColdTrendEmaIsPassedOver(unittest.TestCase):
 
         self.assertEqual(self.h.scheduler.gate_markets, 2)
         self.assertIn("0 of 2 market(s)", self.h.scheduler.warming_text())
+
+    def test_the_ready_note_counts_the_markets_it_is_true_of(self):
+        # The one message that must not overclaim. Readiness is the leading
+        # market's, so a session with one warm market sends "signals active" and
+        # then goes on producing nothing — which is what happened on 2026-09-16
+        # and is the reason the note now carries the count.
+        self.h.scheduler._last_readiness = Readiness(bars=81, bars_needed=56)
+        self.h.scheduler.gate_holders = [self.ASSET]
+        self.h.scheduler.gate_markets = 21
+        self.h.scheduler.gate_needed = 56
+
+        asyncio.run(self.h.scheduler._announce_progress())
+
+        text = " ".join(self.h.sender.texts)
+        self.assertIn("1 of 21 market(s)", text)
+        self.assertNotIn("Fully warmed up", text)
+
+    def test_with_the_veto_off_there_is_no_census_to_report(self):
+        # Every judged market can signal when there is no gate, so a count of
+        # "markets past the veto" would be a line about nothing — and a reader
+        # would take it as a warning.
+        self.h.scheduler.engine_config = SignalConfig(use_trend=False)
+        with self.engine([]):
+            self.play()
+
+        self.assertIsNone(self.h.scheduler._gate_census())
 
 
 class TestASignalSaysWhichEngineProducedIt(SchedulerCase):

@@ -830,13 +830,35 @@ class MinuteScheduler:
         return format_duration(self.cadence.expiry_seconds)
 
     def _readiness(self, healthy: Sequence[str]) -> Readiness:
-        """Readiness of the most advanced market (they warm up together)."""
+        """Readiness of the most advanced market (they do *not* warm together).
+
+        The parenthetical is the correction rather than the design: markets warm
+        at the same *rate* but not from the same start, since a restore keeps
+        only the run after the last hole and the feed drops markets for hours at
+        a time. Measured on 2026-09-16, the leading market held 81 bars while 19
+        of the other 20 held 15-53 — so this is a ceiling on the session's
+        readiness and never a statement about it. ``_gate_census`` is what says
+        how much of the session the number is true of.
+        """
         bars: list[Candle] = []
         for symbol in (list(healthy) or self.symbols):
             closed = self.market.track(symbol).closed()
             if len(closed) > len(bars):
                 bars = closed
         return readiness(bars, self.engine_config)
+
+    def _gate_census(self) -> Optional[tuple[int, int]]:
+        """(markets past the trend veto, markets judged), or None with no veto.
+
+        Read from the last cycle's count rather than recomputed: ``_collect``
+        measures it from the buffers before it asks the engine anything, so it is
+        already the number the refusal line is built from, and both lines should
+        quote the same session. None when the veto is off — then every judged
+        market can signal and there is nothing to count.
+        """
+        if not self.gate_needed or not self.gate_markets:
+            return None
+        return (len(self.gate_holders), self.gate_markets)
 
     async def _announce_startup(self) -> None:
         if self.sender is None:
@@ -858,7 +880,8 @@ class MinuteScheduler:
             if not self._ready_notified:
                 self._ready_notified = True
                 await self.sender.send_text(format_warmup(
-                    r, eta_minutes=0, available=", ".join(r.available)))
+                    r, eta_minutes=0, available=", ".join(r.available),
+                    gate_census=self._gate_census()))
             return
         if now - self._warmup_notified_at < _PROGRESS_EVERY:
             return
@@ -866,7 +889,7 @@ class MinuteScheduler:
         remaining = max(0, r.bars_needed - r.bars)
         await self.sender.send_text(format_warmup(
             r, eta_minutes=int(remaining * self.cadence.period / 60),
-            available=", ".join(r.available)))
+            available=", ".join(r.available), gate_census=self._gate_census()))
 
     async def _persist(self) -> None:
         if self.store is None:

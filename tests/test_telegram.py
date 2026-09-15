@@ -235,6 +235,15 @@ class TestStartupAndStatus(ClockCase):
         self.assertIn("Bars: 30/56", text)
         self.assertIn("Next entry: 16:05:00 (in 5m)", text)
 
+    def test_status_labels_the_bar_count_as_one_markets(self):
+        # It is the maximum across markets, not the session's progress: read
+        # unlabelled, 81/56 over a session where 19 of 21 markets could not be
+        # judged at all says "fully warmed".
+        text = format_status(running=True, assets=21, healthy=16, bars=81,
+                             bars_needed=56, next_entry_at=None, now=BASE)
+
+        self.assertIn("Bars: 81/56 (most advanced market)", text)
+
     def test_status_without_a_next_entry_omits_the_line(self):
         text = format_status(running=False, assets=20, healthy=0, bars=0,
                              bars_needed=56, next_entry_at=None, now=BASE)
@@ -258,6 +267,47 @@ class TestWarmupMessage(unittest.TestCase):
         text = format_warmup(readiness)
 
         self.assertIn("Fully warmed up — signals active.", text)
+
+    def test_a_warm_buffer_does_not_speak_for_a_cold_session(self):
+        # The same message, one bar count higher, over the session the live bot
+        # actually had on 2026-09-16: the leading market held 81 bars while 19 of
+        # the other 20 held 15-53. "Signals active" was true of a market and
+        # false of the bot, and it reads as "the bot is working".
+        readiness = Readiness(bars=81, bars_needed=56, missing=[], available=[])
+        text = format_warmup(readiness, eta_minutes=0, gate_census=(1, 21))
+
+        self.assertIn("The trend veto is warm on 1 of 21 market(s)", text)
+        self.assertIn("only from the markets past the veto", text)
+        self.assertNotIn("Fully warmed up", text)
+
+    def test_a_session_that_is_whole_still_says_so(self):
+        # The claim is kept for the state that earns it, or the note becomes a
+        # caveat nobody reads.
+        readiness = Readiness(bars=81, bars_needed=56, missing=[], available=[])
+        text = format_warmup(readiness, eta_minutes=0, gate_census=(21, 21))
+
+        self.assertIn("Fully warmed up — signals active.", text)
+        self.assertNotIn("veto", text)
+
+    def test_a_partly_warm_session_mid_warmup_reports_both(self):
+        # Both halves are needed while it is still filling: the distance to
+        # readiness, and how much of the session that readiness would be true of.
+        readiness = Readiness(bars=18, bars_needed=56, missing=["trend"],
+                              available=["RSI"])
+        text = format_warmup(readiness, eta_minutes=190, gate_census=(2, 16))
+
+        self.assertIn("Full readiness in ~190 min", text)
+        self.assertIn("2 of 16 market(s)", text)
+
+    def test_no_census_means_no_count_line(self):
+        # With no veto configured there is nothing to count, and an absent
+        # argument must not be read as "zero markets are warm".
+        readiness = Readiness(bars=18, bars_needed=56, missing=["RSI"],
+                              available=[])
+        text = format_warmup(readiness, eta_minutes=190)
+
+        self.assertNotIn("veto", text)
+        self.assertNotIn("market(s)", text)
 
 
 class TestMarkupSafety(ClockCase):

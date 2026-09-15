@@ -528,7 +528,10 @@ the code:
 
 `/status` is where a silent bot explains itself, and it carries three statements
 that are easy to mistake for each other. `Bars: n/56` is the *distance* to warm —
-the maximum across markets, so it says nothing about any one market. The
+the maximum across markets, so it says nothing about any one market. It is
+labelled `(most advanced market)` for exactly that reason: read unlabelled it was
+81/56 on 2026-09-16, over a session where 19 of 21 markets could not be judged at
+all, and a fraction that has passed its denominator reads as *fully warmed*. The
 `⏳ waiting on the trend EMA (n)` line says a setup was actually **refused**, not
 merely that something is short. And the line under it — which on the live store on
 2026-09-16 read, over the 16 markets it was trading —
@@ -541,6 +544,12 @@ merely that something is short. And the line under it — which on the live stor
 difference between sitting through it and choosing `USE_TREND=0` deliberately.
 Without it, "waiting on the trend EMA" reads as a warm-up that is nearly over, and
 that reading was wrong for the whole of the session it was written in.
+
+The warm-up note carries the same count, because it made the same mistake in a
+worse place. Readiness is measured on the leading market, so the note that says
+**"Fully warmed up — signals active."** says it about one market and was read as
+being about the bot; it now names the count, and the whole-session claim is kept
+for the session that earns it.
 
 ## Tests
 

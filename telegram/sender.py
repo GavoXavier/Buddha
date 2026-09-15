@@ -244,18 +244,37 @@ def format_confirmation(asset: str, direction: str, outcome: str,
 
 
 def format_warmup(readiness: Readiness, eta_minutes: Optional[int] = None,
-                  available: str = "") -> str:
-    """Progress note while the buffer fills: what works now, what is still missing."""
+                  available: str = "", gate_census: Optional[tuple[int, int]] = None) -> str:
+    """Progress note while the buffer fills: what works now, what is still missing.
+
+    ``gate_census`` is (markets past the trend veto, markets judged), and it is
+    what keeps the last line from overclaiming. Readiness is measured on *one*
+    market — the most advanced — and readiness on one market is not a session
+    where signals can happen. Measured on 2026-09-16: the leading market held 81
+    bars while 19 of the other 20 held 15-53, so "Fully warmed up — signals
+    active" was true of a market and false of the bot, and it is the one line a
+    reader takes as "the bot is working". The veto refuses judged setups rather
+    than merely voting against them, so where it is cold there is no signal to
+    wait for however warm the indicators are.
+    """
     lines = [
         "⏳ <b>Warming up</b>",
-        f"Bars: {readiness.bars}/{readiness.bars_needed}",
+        f"Bars: {readiness.bars}/{readiness.bars_needed} (most advanced market)",
     ]
     if available:
         lines.append(f"Live indicators: {available}")
     if readiness.missing:
         lines.append("Waiting on: " + ", ".join(readiness.missing))
+    warm, judged = gate_census if gate_census else (0, 0)
+    vetoed = judged > 0 and warm < judged
+    if vetoed:
+        lines.append(f"⚠️ The trend veto is warm on {warm} of {judged} market(s) — "
+                     f"the rest cannot be judged yet.")
     if eta_minutes is not None and eta_minutes > 0:
         lines.append(f"Full readiness in ~{eta_minutes} min")
+    elif vetoed:
+        # The whole-session claim, made only when the whole session earns it.
+        lines.append("Signals are live only from the markets past the veto.")
     else:
         lines.append("Fully warmed up — signals active.")
     return "\n".join(lines)
@@ -286,7 +305,11 @@ def format_status(*, running: bool, assets: int, healthy: int, bars: int,
         "📡 <b>Status</b>",
         f"Bot: {'running' if running else 'paused'}",
         f"Markets: {healthy}/{assets} live",
-        f"Bars: {bars}/{bars_needed}",
+        # Labelled, because it is the maximum across markets rather than the
+        # session's state: on 2026-09-16 this read 81/56 while 19 of 21 markets
+        # could not be judged at all, and an unlabelled fraction passing its
+        # denominator reads as "fully warmed".
+        f"Bars: {bars}/{bars_needed} (most advanced market)",
     ]
     if next_entry_at:
         left = max(0, int(round(next_entry_at - now)))
